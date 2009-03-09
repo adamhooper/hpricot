@@ -12,6 +12,9 @@ module Hpricot
       Hpricot.make(input, @options, &blk).children
     end
     def altered!; end
+    def inspect_tree
+      children.map { |x| x.inspect_tree }.join if children
+    end
   end
 
   class BaseEle
@@ -29,6 +32,9 @@ module Hpricot
     def altered!
       clear_raw
     end
+    def inspect_tree(depth = 0)
+      %{#{" " * depth}} + self.class.name.split(/::/).last.downcase + "\n"
+    end
   end
 
   class Elem
@@ -43,6 +49,8 @@ module Hpricot
           hsh[k] = Hpricot.uxs(v)
           hsh
         end
+      else
+        {}
       end
     end
     def to_plain_text
@@ -87,6 +95,10 @@ module Hpricot
         end.join
       end
     end
+    def inspect_tree(depth = 0)
+      %{#{" " * depth}} + name + "\n" +
+        (children ? children.map { |x| x.inspect_tree(depth + 1) }.join : "")
+    end
   end
 
   class ETag
@@ -115,7 +127,7 @@ module Hpricot
     def output(out, opts = {})
       out <<
         if_output(opts) do
-          content
+          content.to_s
         end
     end
   end

@@ -19,10 +19,10 @@ VALUE hpricot_css(VALUE, VALUE, VALUE, VALUE, VALUE);
 #define NO_WAY_SERIOUSLY "*** This should not happen, please send a bug report with the HTML you're parsing to why@whytheluckystiff.net.  So sorry!"
 
 static VALUE sym_xmldecl, sym_doctype, sym_procins, sym_stag, sym_etag, sym_emptytag, sym_comment,
-      sym_cdata, sym_text, sym_EMPTY;
+      sym_cdata, sym_text, sym_EMPTY, sym_CDATA;
 static VALUE mHpricot, rb_eHpricotParseError;
 static VALUE cBaseEle, cBogusETag, cCData, cComment, cDoc, cDocType, cElem, cETag, cText,
-      cXMLDecl, cProcIns;
+      cXMLDecl, cProcIns, symAllow, symDeny;
 static ID s_ElementContent;
 static ID s_downcase, s_new, s_parent, s_read, s_to_str;
 static ID iv_parent;
@@ -30,7 +30,7 @@ static VALUE reProcInsParse;
 
 typedef struct {
   int name;
-  VALUE tag, attr, etag, raw;
+  VALUE tag, attr, etag, raw, EC;
   VALUE parent, children;
 } hpricot_ele;
 
@@ -249,6 +249,7 @@ hpricot_ele_clear_raw(VALUE self)
   he->tag = tag; \
   he->attr = attr; \
   he->raw = Qnil; \
+  he->EC = ec; \
   he->etag = he->parent = he->children = Qnil; \
   if (raw != NULL && (sym == sym_emptytag || sym == sym_stag || sym == sym_etag || sym == sym_doctype)) { \
     he->raw = rb_str_new(raw, rawlen); \
@@ -262,7 +263,7 @@ hpricot_ele_alloc(VALUE klass)
   VALUE ele;
   hpricot_ele *he = ALLOC(hpricot_ele);
   he->name = 0;
-  he->tag = he->attr = he->raw = Qnil;
+  he->tag = he->attr = he->raw = he->EC = Qnil;
   he->etag = he->parent = he->children = Qnil;
   ele = Data_Wrap_Struct(klass, hpricot_ele_mark, hpricot_ele_free, he);
   return ele;
@@ -272,7 +273,7 @@ hpricot_ele_alloc(VALUE klass)
 // the swift, compact parser logic.  most of the complicated stuff is done
 // in the lexer.  this step just pairs up the start and end tags.
 //
-VALUE
+void
 rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, int rawlen, int taint)
 {
   VALUE ele, ec = Qnil;
@@ -281,6 +282,16 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
   // in html mode, fix up start tags incorrectly formed as empty tags
   //
   if (!S->xml) {
+    hpricot_ele *last;
+    Data_Get_Struct(S->focus, hpricot_ele, last);
+    if (last->EC == sym_CDATA &&
+       (sym != sym_procins && sym != sym_comment && sym != sym_cdata && sym != sym_text) &&
+      !(sym == sym_etag && rb_str_hash(tag) == last->name))
+    {
+      sym = sym_text;
+      tag = rb_str_new(raw, rawlen);
+    }
+
     if (sym == sym_emptytag || sym == sym_stag || sym == sym_etag) {
       ec = rb_hash_aref(S->EC, tag);
       if (NIL_P(ec)) {
@@ -300,6 +311,37 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
   if (sym == sym_emptytag || sym == sym_stag) {
     H_ELE(cElem);
     he->name = rb_str_hash(tag);
+
+    if (!S->xml) {
+      VALUE match = Qnil, e = S->focus;
+      while (e != S->doc)
+      {
+        hpricot_ele *hee;
+        Data_Get_Struct(e, hpricot_ele, hee);
+
+        if (TYPE(hee->EC) == T_HASH)
+        {
+          VALUE has = rb_hash_lookup(hee->EC, INT2NUM(he->name));
+          if (has != Qnil) {
+            if (has == Qtrue) {
+              if (match == Qnil)
+                match = e;
+            } else if (has == symAllow) {
+              match = S->focus;
+            } else if (has == symDeny) {
+              match = Qnil;
+            }
+          }
+        }
+
+        e = hee->parent;
+      }
+
+      if (match == Qnil)
+        match = S->focus;
+      S->focus = match;
+    }
+
     rb_hpricot_add(S->focus, ele);
 
     //
@@ -325,6 +367,8 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
     //
     // another optimization will be to improve this very simple
     // O(n) tag search, where n is the depth of the focused tag.
+    //
+    // (see also: the search above for fixups)
     //
     name = rb_str_hash(tag);
     while (e != S->doc)
@@ -371,8 +415,10 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
     VALUE match = rb_funcall(tag, rb_intern("match"), 1, reProcInsParse);
     tag = rb_reg_nth_match(1, match);
     attr = rb_reg_nth_match(2, match);
-    H_ELE(cProcIns);
-    rb_hpricot_add(S->focus, ele);
+    {
+        H_ELE(cProcIns);
+        rb_hpricot_add(S->focus, ele);
+    }
   } else if (sym == sym_text) {
     // TODO: add raw_string as well?
     if (!NIL_P(S->last) && RBASIC(S->last)->klass == cText) {
@@ -420,8 +466,8 @@ VALUE hpricot_scan(int argc, VALUE *argv, VALUE self)
 
   if (!rb_block_given_p())
   {
-    S = ALLOC(hpricot_state);
     hpricot_ele *he = ALLOC(hpricot_ele);
+    S = ALLOC(hpricot_state);
     MEMZERO(he, hpricot_ele, 1);
     he->tag = he->attr = he->etag = he->parent = he->children = Qnil;
     S->doc = Data_Wrap_Struct(cDoc, hpricot_ele_mark, hpricot_ele_free, he);
@@ -432,6 +478,7 @@ VALUE hpricot_scan(int argc, VALUE *argv, VALUE self)
     S->strict = OPT(opts, xhtml_strict);
     S->fixup = OPT(opts, fixup_tags);
     if (S->strict) S->fixup = 1;
+    rb_ivar_set(S->doc, rb_intern("@options"), opts);
 
     S->EC = rb_const_get(mHpricot, s_ElementContent);
   }
@@ -463,7 +510,7 @@ VALUE hpricot_scan(int argc, VALUE *argv, VALUE self)
        mark_aval_diff = mark_aval - buf;
 
        buffer_size += BUFSIZE;
-       buf = REALLOC_N(buf, char, buffer_size);
+       REALLOC_N(buf, char, buffer_size);
 
        space = buffer_size - have;
 
@@ -477,16 +524,17 @@ VALUE hpricot_scan(int argc, VALUE *argv, VALUE self)
 
     if ( rb_respond_to( port, s_read ) )
     {
-      str = rb_funcall( port, s_read, 1, INT2FIX(space) );
+      str = rb_funcall(port, s_read, 1, INT2FIX(space));
+      len = RSTRING_LEN(str);
+      memcpy(p, StringValuePtr(str), len);
     }
     else
     {
-      str = rb_str_substr( port, nread, space );
+      len = RSTRING_LEN(port) - nread;
+      if (len > space) len = space;
+      memcpy(p, StringValuePtr(port) + nread, len);
     }
 
-    StringValue(str);
-    memcpy( p, RSTRING_PTR(str), RSTRING_LEN(str) );
-    len = RSTRING_LEN(str);
     nread += len;
 
     /* If this is the last buffer, tack on an EOF. */
@@ -627,6 +675,8 @@ void Init_hpricot_scan()
   rb_define_method(cProcIns, "content=", hpricot_ele_set_attr, 1);
 
   s_ElementContent = rb_intern("ElementContent");
+  symAllow = ID2SYM(rb_intern("allow"));
+  symDeny = ID2SYM(rb_intern("deny"));
   s_downcase = rb_intern("downcase");
   s_new = rb_intern("new");
   s_parent = rb_intern("parent");
@@ -643,6 +693,7 @@ void Init_hpricot_scan()
   sym_cdata = ID2SYM(rb_intern("cdata"));
   sym_text = ID2SYM(rb_intern("text"));
   sym_EMPTY = ID2SYM(rb_intern("EMPTY"));
+  sym_CDATA = ID2SYM(rb_intern("CDATA"));
 
   rb_const_set(mHpricot, rb_intern("ProcInsParse"),
     reProcInsParse = rb_eval_string("/\\A<\\?(\\S+)\\s+(.+)/m"));

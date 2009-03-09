@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #!/usr/bin/env ruby
 
 require 'test/unit'
@@ -9,7 +10,10 @@ class TestPreserved < Test::Unit::TestCase
     doc = Hpricot(str)
     yield doc if block_given?
     str2 = doc.to_original_html
-    [*str].zip([*str2]).each do |s1, s2|
+    if RUBY_VERSION =~ /^1.9/
+      str2.force_encoding('UTF-8')
+    end
+    str.lines.zip(str2.lines).each do |s1, s2|
       assert_equal s1, s2
     end
   end
@@ -40,7 +44,7 @@ class TestPreserved < Test::Unit::TestCase
 
   def test_escaping_of_contents
     doc = Hpricot(TestFiles::BOINGBOING)
-    assert_equal "Fukuda\342\200\231s Automatic Door opens around your body as you pass through it. The idea is to save energy and keep the room clean.", doc.at("img[@alt='200606131240']").next.to_s.strip
+    assert_equal "Fukuda’s Automatic Door opens around your body as you pass through it. The idea is to save energy and keep the room clean.", doc.at("img[@alt='200606131240']").next.to_s.strip
   end
 
   def test_files

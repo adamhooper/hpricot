@@ -4,6 +4,12 @@
 #include <assert.h>
 /* #include <stdio.h> */
 
+#ifndef RARRAY_LEN
+#define RARRAY_LEN(arr)  RARRAY(arr)->len
+#define RSTRING_LEN(str) RSTRING(str)->len
+#define RSTRING_PTR(str) RSTRING(str)->ptr
+#endif
+
 static ID unpack_id;
 static VALUE U_fmt, C_fmt;
 
@@ -109,7 +115,7 @@ static long escape(char *buf, int n)
 
 	if (VALID_VALUE(n)) {
 		/* return snprintf(buf, sizeof("&#1114111;"), "&#%i;", n); */
-		extern const char ruby_digitmap[];
+		RUBY_EXTERN const char ruby_digitmap[];
 		int rv = 3; /* &#; */
 		buf += bytes_for(n);
 		*--buf = ';';
@@ -166,14 +172,14 @@ VALUE fast_xs(VALUE self)
 
 	array = RARRAY(rb_rescue(unpack_utf8, self, unpack_uchar, self));
 
-	tmp = array->ptr;
-	for (i = array->len; --i >= 0; tmp++)
+	tmp = RARRAY_PTR(array);
+	for (i = RARRAY_LEN(array); --i >= 0; tmp++)
 		s_len += escaped_len(NUM2INT(*tmp));
 
 	c = s = alloca(s_len + 1);
 
-	tmp = array->ptr;
-	for (i = array->len; --i >= 0; tmp++)
+	tmp = RARRAY_PTR(array);
+	for (i = RARRAY_LEN(array); --i >= 0; tmp++)
 		c += escape(c, NUM2INT(*tmp));
 
 	*c = '\0';
