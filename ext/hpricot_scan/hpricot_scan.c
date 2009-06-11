@@ -1,3 +1,4 @@
+
 #line 1 "hpricot_scan.rl"
 /*
  * hpricot_scan.rl
@@ -20,20 +21,26 @@ VALUE hpricot_css(VALUE, VALUE, VALUE, VALUE, VALUE);
 #define NO_WAY_SERIOUSLY "*** This should not happen, please send a bug report with the HTML you're parsing to why@whytheluckystiff.net.  So sorry!"
 
 static VALUE sym_xmldecl, sym_doctype, sym_procins, sym_stag, sym_etag, sym_emptytag, sym_comment,
-      sym_cdata, sym_text, sym_EMPTY, sym_CDATA;
+      sym_cdata, sym_name, sym_parent, sym_raw_attributes, sym_raw_string, sym_tagno,
+      sym_allowed, sym_text, sym_children, sym_EMPTY, sym_CDATA;
 static VALUE mHpricot, rb_eHpricotParseError;
-static VALUE cBaseEle, cBogusETag, cCData, cComment, cDoc, cDocType, cElem, cETag, cText,
+static VALUE cBogusETag, cCData, cComment, cDoc, cDocType, cElem, cText,
       cXMLDecl, cProcIns, symAllow, symDeny;
 static ID s_ElementContent;
 static ID s_downcase, s_new, s_parent, s_read, s_to_str;
-static ID iv_parent;
 static VALUE reProcInsParse;
 
-typedef struct {
-  int name;
-  VALUE tag, attr, etag, raw, EC;
-  VALUE parent, children;
-} hpricot_ele;
+#define H_ELE_TAG      0
+#define H_ELE_PARENT   1
+#define H_ELE_ATTR     2
+#define H_ELE_ETAG     3
+#define H_ELE_RAW      4
+#define H_ELE_EC       5
+#define H_ELE_HASH     6
+#define H_ELE_CHILDREN 7
+
+#define H_ELE_GET(ele, idx)      RSTRUCT_PTR(ele)[idx]
+#define H_ELE_SET(ele, idx, val) RSTRUCT_PTR(ele)[idx] = val
 
 #define OPT(opts, key) (!NIL_P(opts) && RTEST(rb_hash_aref(opts, ID2SYM(rb_intern("" # key)))))
 
@@ -61,7 +68,7 @@ typedef struct {
 
 #define CAT(N, E) if (NIL_P(N)) { SET(N, E); } else { rb_str_cat(N, mark_##N, E - mark_##N); }
 
-#define SLIDE(N) if ( mark_##N > ts ) mark_##N = buf + (mark_##N - ts);
+#define SLIDE(N) if (mark_##N > ts) mark_##N = buf + (mark_##N - ts);
 
 #define ATTR(K, V) \
     if (!NIL_P(K)) { \
@@ -87,11 +94,12 @@ typedef struct {
 
 #define EBLK(N, T) CAT(tag, p - T + 1); ELE(N);
 
-#line 134 "hpricot_scan.rl"
+
+#line 142 "hpricot_scan.rl"
 
 
 
-#line 95 "hpricot_scan.c"
+#line 103 "hpricot_scan.c"
 static const int hpricot_scan_start = 204;
 static const int hpricot_scan_error = -1;
 
@@ -100,7 +108,8 @@ static const int hpricot_scan_en_html_cdata = 216;
 static const int hpricot_scan_en_html_procins = 218;
 static const int hpricot_scan_en_main = 204;
 
-#line 137 "hpricot_scan.rl"
+
+#line 145 "hpricot_scan.rl"
 
 #define BUFSIZE 16384
 
@@ -111,7 +120,7 @@ void rb_yield_tokens(VALUE sym, VALUE tag, VALUE attr, VALUE raw, int taint)
     raw = tag;
   }
   ary = rb_ary_new3(4, sym, tag, attr, raw);
-  if (taint) { 
+  if (taint) {
     OBJ_TAINT(ary);
     OBJ_TAINT(tag);
     OBJ_TAINT(attr);
@@ -120,6 +129,7 @@ void rb_yield_tokens(VALUE sym, VALUE tag, VALUE attr, VALUE raw, int taint)
   rb_yield(ary);
 }
 
+#ifndef RHASH_TBL
 /* rb_hash_lookup() is only in Ruby 1.8.7 */
 static VALUE
 our_rb_hash_lookup(VALUE hash, VALUE key)
@@ -132,17 +142,17 @@ our_rb_hash_lookup(VALUE hash, VALUE key)
 
   return val;
 }
+#define rb_hash_lookup our_rb_hash_lookup
+#endif
 
 static void
 rb_hpricot_add(VALUE focus, VALUE ele)
 {
-  hpricot_ele *he, *he2;
-  Data_Get_Struct(focus, hpricot_ele, he);
-  Data_Get_Struct(ele, hpricot_ele, he2);
-  if (NIL_P(he->children))
-    he->children = rb_ary_new();
-  rb_ary_push(he->children, ele);
-  he2->parent = focus;
+  VALUE children = H_ELE_GET(focus, H_ELE_CHILDREN);
+  if (NIL_P(children))
+    H_ELE_SET(focus, H_ELE_CHILDREN, (children = rb_ary_new2(1)));
+  rb_ary_push(children, ele);
+  H_ELE_SET(ele, H_ELE_PARENT, focus);
 }
 
 typedef struct {
@@ -153,101 +163,69 @@ typedef struct {
   unsigned char xml, strict, fixup;
 } hpricot_state;
 
-static void
-hpricot_ele_mark(hpricot_ele *he)
-{
-  rb_gc_mark(he->tag);
-  rb_gc_mark(he->attr);
-  rb_gc_mark(he->etag);
-  rb_gc_mark(he->raw);
-  rb_gc_mark(he->parent);
-  rb_gc_mark(he->children);
-}
-
-static void
-hpricot_ele_free(hpricot_ele *he)
-{
-  free(he);
-}
-
-#define H_PROP(prop) \
+#define H_PROP(prop, idx) \
   static VALUE hpricot_ele_set_##prop(VALUE self, VALUE x) { \
-    hpricot_ele *he; \
-    Data_Get_Struct(self, hpricot_ele, he); \
-    he->prop = x; \
+    H_ELE_SET(self, idx, x); \
     return self; \
   } \
+  static VALUE hpricot_ele_clear_##prop(VALUE self) { \
+    H_ELE_SET(self, idx, Qnil); \
+    return Qtrue; \
+  } \
   static VALUE hpricot_ele_get_##prop(VALUE self) { \
-    hpricot_ele *he; \
-    Data_Get_Struct(self, hpricot_ele, he); \
-    return he->prop; \
+    return H_ELE_GET(self, idx); \
   }
 
 #define H_ATTR(prop) \
   static VALUE hpricot_ele_set_##prop(VALUE self, VALUE x) { \
-    hpricot_ele *he; \
-    Data_Get_Struct(self, hpricot_ele, he); \
-    rb_hash_aset(he->attr, ID2SYM(rb_intern("" # prop)), x); \
+    rb_hash_aset(H_ELE_GET(self, H_ELE_ATTR), ID2SYM(rb_intern("" # prop)), x); \
     return self; \
   } \
   static VALUE hpricot_ele_get_##prop(VALUE self) { \
-    hpricot_ele *he; \
-    Data_Get_Struct(self, hpricot_ele, he); \
-    return rb_hash_aref(he->attr, ID2SYM(rb_intern("" # prop))); \
+    return rb_hash_aref(H_ELE_GET(self, H_ELE_ATTR), ID2SYM(rb_intern("" # prop))); \
   }
 
-H_PROP(tag);
-H_PROP(attr);
-H_PROP(etag);
-H_PROP(parent);
-H_PROP(children);
+H_PROP(name, H_ELE_TAG);
+H_PROP(raw, H_ELE_RAW);
+H_PROP(parent, H_ELE_PARENT);
+H_PROP(attr, H_ELE_ATTR);
+H_PROP(etag, H_ELE_ETAG);
+H_PROP(children, H_ELE_CHILDREN);
+H_ATTR(target);
 H_ATTR(encoding);
 H_ATTR(version);
 H_ATTR(standalone);
 H_ATTR(system_id);
 H_ATTR(public_id);
 
-static VALUE
-hpricot_ele_get_raw(VALUE self, VALUE x) {
-  hpricot_ele *he;
-  Data_Get_Struct(self, hpricot_ele, he);
-  return he->raw;
-}
-
-static VALUE
-hpricot_ele_clear_raw(VALUE self)
-{
-  hpricot_ele *he;
-  Data_Get_Struct(self, hpricot_ele, he);
-  he->raw = Qnil;
-  return Qtrue;
-}
-
 #define H_ELE(klass) \
-  hpricot_ele *he = ALLOC(hpricot_ele); \
-  he->name = 0; \
-  he->tag = tag; \
-  he->attr = attr; \
-  he->raw = Qnil; \
-  he->EC = ec; \
-  he->etag = he->parent = he->children = Qnil; \
-  if (raw != NULL && (sym == sym_emptytag || sym == sym_stag || sym == sym_etag || sym == sym_doctype)) { \
-    he->raw = rb_str_new(raw, rawlen); \
+  ele = rb_obj_alloc(klass); \
+  if (klass == cElem) { \
+    H_ELE_SET(ele, H_ELE_TAG, tag); \
+    H_ELE_SET(ele, H_ELE_ATTR, attr); \
+    H_ELE_SET(ele, H_ELE_EC, ec); \
+    if (raw != NULL && (sym == sym_emptytag || sym == sym_stag || sym == sym_doctype)) { \
+      H_ELE_SET(ele, H_ELE_RAW, rb_str_new(raw, rawlen)); \
+    } \
+  } else if (klass == cDocType || klass == cProcIns || klass == cXMLDecl || klass == cBogusETag) { \
+    if (klass == cBogusETag) { \
+      H_ELE_SET(ele, H_ELE_TAG, tag); \
+      if (raw != NULL) \
+        H_ELE_SET(ele, H_ELE_ATTR, rb_str_new(raw, rawlen)); \
+    } else { \
+      if (klass == cDocType) \
+        ATTR(ID2SYM(rb_intern("target")), tag); \
+      H_ELE_SET(ele, H_ELE_ATTR, attr); \
+      if (klass != cProcIns) { \
+        tag = Qnil; \
+        if (raw != NULL) tag = rb_str_new(raw, rawlen); \
+      } \
+      H_ELE_SET(ele, H_ELE_TAG, tag); \
+    } \
+  } else { \
+    H_ELE_SET(ele, H_ELE_TAG, tag); \
   } \
-  ele = Data_Wrap_Struct(klass, hpricot_ele_mark, hpricot_ele_free, he); \
   S->last = ele
-
-VALUE
-hpricot_ele_alloc(VALUE klass)
-{
-  VALUE ele;
-  hpricot_ele *he = ALLOC(hpricot_ele);
-  he->name = 0;
-  he->tag = he->attr = he->raw = he->EC = Qnil;
-  he->etag = he->parent = he->children = Qnil;
-  ele = Data_Wrap_Struct(klass, hpricot_ele_mark, hpricot_ele_free, he);
-  return ele;
-}
 
 //
 // the swift, compact parser logic.  most of the complicated stuff is done
@@ -262,22 +240,23 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
   // in html mode, fix up start tags incorrectly formed as empty tags
   //
   if (!S->xml) {
-    hpricot_ele *last;
-    Data_Get_Struct(S->focus, hpricot_ele, last);
-    if (last->EC == sym_CDATA &&
-       (sym != sym_procins && sym != sym_comment && sym != sym_cdata && sym != sym_text) &&
-      !(sym == sym_etag && rb_str_hash(tag) == last->name))
-    {
-      sym = sym_text;
-      tag = rb_str_new(raw, rawlen);
-    }
-
     if (sym == sym_emptytag || sym == sym_stag || sym == sym_etag) {
       ec = rb_hash_aref(S->EC, tag);
       if (NIL_P(ec)) {
         tag = rb_funcall(tag, s_downcase, 0);
         ec = rb_hash_aref(S->EC, tag);
       }
+    }
+
+    if (H_ELE_GET(S->focus, H_ELE_EC) == sym_CDATA &&
+       (sym != sym_procins && sym != sym_comment && sym != sym_cdata && sym != sym_text) &&
+      !(sym == sym_etag && INT2FIX(rb_str_hash(tag)) == H_ELE_GET(S->focus, H_ELE_HASH)))
+    {
+      sym = sym_text;
+      tag = rb_str_new(raw, rawlen);
+    }
+
+    if (!NIL_P(ec)) {
       if (sym == sym_emptytag) {
         if (ec != sym_EMPTY)
           sym = sym_stag;
@@ -289,19 +268,19 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
   }
 
   if (sym == sym_emptytag || sym == sym_stag) {
+    VALUE name = INT2FIX(rb_str_hash(tag));
     H_ELE(cElem);
-    he->name = rb_str_hash(tag);
+    H_ELE_SET(ele, H_ELE_HASH, name);
 
     if (!S->xml) {
       VALUE match = Qnil, e = S->focus;
       while (e != S->doc)
       {
-        hpricot_ele *hee;
-        Data_Get_Struct(e, hpricot_ele, hee);
+        VALUE hEC = H_ELE_GET(e, H_ELE_EC);
 
-        if (TYPE(hee->EC) == T_HASH)
+        if (TYPE(hEC) == T_HASH)
         {
-          VALUE has = our_rb_hash_lookup(hee->EC, INT2NUM(he->name));
+          VALUE has = rb_hash_lookup(hEC, name);
           if (has != Qnil) {
             if (has == Qtrue) {
               if (match == Qnil)
@@ -314,7 +293,7 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
           }
         }
 
-        e = hee->parent;
+        e = H_ELE_GET(e, H_ELE_PARENT);
       }
 
       if (match == Qnil)
@@ -336,8 +315,7 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
       }
     }
   } else if (sym == sym_etag) {
-    int name;
-    VALUE match = Qnil, e = S->focus;
+    VALUE name, match = Qnil, e = S->focus;
     if (S->strict) {
       if (NIL_P(rb_hash_aref(S->EC, tag))) {
         tag = rb_str_new2("div");
@@ -350,19 +328,16 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
     //
     // (see also: the search above for fixups)
     //
-    name = rb_str_hash(tag);
+    name = INT2FIX(rb_str_hash(tag));
     while (e != S->doc)
     {
-      hpricot_ele *he;
-      Data_Get_Struct(e, hpricot_ele, he);
-
-      if (he->name == name)
+      if (H_ELE_GET(e, H_ELE_HASH) == name)
       {
         match = e;
         break;
       }
 
-      e = he->parent;
+      e = H_ELE_GET(e, H_ELE_PARENT);
     }
 
     if (NIL_P(match))
@@ -372,10 +347,11 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
     }
     else
     {
-      H_ELE(cETag);
-      Data_Get_Struct(match, hpricot_ele, he);
-      he->etag = ele;
-      S->focus = he->parent;
+      VALUE ele = Qnil;
+      if (raw != NULL)
+        ele = rb_str_new(raw, rawlen);
+      H_ELE_SET(match, H_ELE_ETAG, ele);
+      S->focus = H_ELE_GET(match, H_ELE_PARENT);
       S->last = Qnil;
     }
   } else if (sym == sym_cdata) {
@@ -396,15 +372,13 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
     tag = rb_reg_nth_match(1, match);
     attr = rb_reg_nth_match(2, match);
     {
-        H_ELE(cProcIns);
-        rb_hpricot_add(S->focus, ele);
+      H_ELE(cProcIns);
+      rb_hpricot_add(S->focus, ele);
     }
   } else if (sym == sym_text) {
     // TODO: add raw_string as well?
     if (!NIL_P(S->last) && RBASIC(S->last)->klass == cText) {
-      hpricot_ele *he;
-      Data_Get_Struct(S->last, hpricot_ele, he);
-      rb_str_append(he->tag, tag);
+      rb_str_append(H_ELE_GET(S->last, H_ELE_TAG), tag);
     } else {
       H_ELE(cText);
       rb_hpricot_add(S->focus, ele);
@@ -417,7 +391,7 @@ rb_hpricot_token(hpricot_state *S, VALUE sym, VALUE tag, VALUE attr, char *raw, 
 
 VALUE hpricot_scan(int argc, VALUE *argv, VALUE self)
 {
-  int cs, act, have = 0, nread = 0, curline = 1, text = 0;
+  int cs, act, have = 0, nread = 0, curline = 1, text = 0, io = 0;
   char *ts = 0, *te = 0, *buf = NULL, *eof = NULL;
 
   hpricot_state *S = NULL;
@@ -427,12 +401,13 @@ VALUE hpricot_scan(int argc, VALUE *argv, VALUE self)
   int done = 0, ele_open = 0, buffer_size = 0, taint = 0;
 
   rb_scan_args(argc, argv, "11", &port, &opts);
-  taint = OBJ_TAINTED( port );
-  if ( !rb_respond_to( port, s_read ) )
+  taint = OBJ_TAINTED(port);
+  io = rb_respond_to(port, s_read);
+  if (!io)
   {
-    if ( rb_respond_to( port, s_to_str ) )
+    if (rb_respond_to(port, s_to_str))
     {
-      port = rb_funcall( port, s_to_str, 0 );
+      port = rb_funcall(port, s_to_str, 0);
       StringValue(port);
     }
     else
@@ -446,11 +421,8 @@ VALUE hpricot_scan(int argc, VALUE *argv, VALUE self)
 
   if (!rb_block_given_p())
   {
-    hpricot_ele *he = ALLOC(hpricot_ele);
     S = ALLOC(hpricot_state);
-    MEMZERO(he, hpricot_ele, 1);
-    he->tag = he->attr = he->etag = he->parent = he->children = Qnil;
-    S->doc = Data_Wrap_Struct(cDoc, hpricot_ele_mark, hpricot_ele_free, he);
+    S->doc = rb_obj_alloc(cDoc);
     rb_gc_register_address(&S->doc);
     S->focus = S->doc;
     S->last = Qnil;
@@ -470,70 +442,73 @@ VALUE hpricot_scan(int argc, VALUE *argv, VALUE self)
       buffer_size = NUM2INT(bufsize);
     }
   }
-  buf = ALLOC_N(char, buffer_size);
+
+  if (io)
+    buf = ALLOC_N(char, buffer_size);
 
   
-#line 477 "hpricot_scan.c"
+#line 451 "hpricot_scan.c"
 	{
 	cs = hpricot_scan_start;
 	ts = 0;
 	te = 0;
 	act = 0;
 	}
-#line 509 "hpricot_scan.rl"
-  
-  while ( !done ) {
+
+#line 482 "hpricot_scan.rl"
+
+  while (!done) {
     VALUE str;
     char *p, *pe;
     int len, space = buffer_size - have, tokstart_diff, tokend_diff, mark_tag_diff, mark_akey_diff, mark_aval_diff;
 
-    if ( space == 0 ) {
-      /* We've used up the entire buffer storing an already-parsed token
-       * prefix that must be preserved.  Likely caused by super-long attributes.
-       * Increase buffer size and continue  */
-       tokstart_diff = ts - buf;
-       tokend_diff = te - buf;
-       mark_tag_diff = mark_tag - buf;
-       mark_akey_diff = mark_akey - buf;
-       mark_aval_diff = mark_aval - buf;
-
-       buffer_size += BUFSIZE;
-       REALLOC_N(buf, char, buffer_size);
-
-       space = buffer_size - have;
-
-       ts= buf + tokstart_diff;
-       te = buf + tokend_diff;
-       mark_tag = buf + mark_tag_diff;
-       mark_akey = buf + mark_akey_diff;
-       mark_aval = buf + mark_aval_diff;
-    }
-    p = buf + have;
-
-    if ( rb_respond_to( port, s_read ) )
+    if (io)
     {
+      if (space == 0) {
+        /* We've used up the entire buffer storing an already-parsed token
+         * prefix that must be preserved.  Likely caused by super-long attributes.
+         * Increase buffer size and continue  */
+         tokstart_diff = ts - buf;
+         tokend_diff = te - buf;
+         mark_tag_diff = mark_tag - buf;
+         mark_akey_diff = mark_akey - buf;
+         mark_aval_diff = mark_aval - buf;
+
+         buffer_size += BUFSIZE;
+         REALLOC_N(buf, char, buffer_size);
+
+         space = buffer_size - have;
+
+         ts = buf + tokstart_diff;
+         te = buf + tokend_diff;
+         mark_tag = buf + mark_tag_diff;
+         mark_akey = buf + mark_akey_diff;
+         mark_aval = buf + mark_aval_diff;
+      }
+      p = buf + have;
+
       str = rb_funcall(port, s_read, 1, INT2FIX(space));
       len = RSTRING_LEN(str);
       memcpy(p, StringValuePtr(str), len);
     }
     else
     {
-      len = RSTRING_LEN(port) - nread;
-      if (len > space) len = space;
-      memcpy(p, StringValuePtr(port) + nread, len);
+      p = RSTRING_PTR(port);
+      len = RSTRING_LEN(port) + 1;
+      done = 1;
     }
 
     nread += len;
 
     /* If this is the last buffer, tack on an EOF. */
-    if ( len < space ) {
+    if (io && len < space) {
       p[len++] = 0;
       done = 1;
     }
 
     pe = p + len;
     
-#line 537 "hpricot_scan.c"
+#line 512 "hpricot_scan.c"
 	{
 	if ( p == pe )
 		goto _test_eof;
@@ -548,7 +523,7 @@ tr4:
 	{te = p+1;{ {goto st214;} }}
 	goto st204;
 tr15:
-#line 107 "hpricot_scan.rl"
+#line 113 "hpricot_scan.rl"
 	{ SET(tag, p); }
 #line 66 "hpricot_scan.rl"
 	{te = p+1;{ ELE(doctype); }}
@@ -580,7 +555,7 @@ tr93:
 	{te = p+1;{ {goto st216;} }}
 	goto st204;
 tr97:
-#line 107 "hpricot_scan.rl"
+#line 113 "hpricot_scan.rl"
 	{ SET(tag, p); }
 #line 69 "hpricot_scan.rl"
 	{te = p+1;{ ELE(etag); }}
@@ -590,7 +565,7 @@ tr99:
 	{te = p+1;{ ELE(etag); }}
 	goto st204;
 tr103:
-#line 107 "hpricot_scan.rl"
+#line 113 "hpricot_scan.rl"
 	{ SET(tag, p); }
 #line 68 "hpricot_scan.rl"
 	{te = p+1;{ ELE(stag); }}
@@ -600,18 +575,22 @@ tr107:
 	{te = p+1;{ ELE(stag); }}
 	goto st204;
 tr112:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
 	{te = p+1;{ ELE(stag); }}
 	goto st204;
 tr117:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -622,25 +601,29 @@ tr118:
 	{te = p+1;{ ELE(emptytag); }}
 	goto st204;
 tr129:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
 	{te = p+1;{ ELE(stag); }}
 	goto st204;
 tr133:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -648,15 +631,17 @@ tr133:
 	{te = p+1;{ ELE(stag); }}
 	goto st204;
 tr139:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -700,7 +685,7 @@ st204:
 case 204:
 #line 1 "hpricot_scan.rl"
 	{ts = p;}
-#line 704 "hpricot_scan.c"
+#line 689 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 10: goto tr412;
 		case 60: goto tr413;
@@ -709,7 +694,7 @@ case 204:
 tr413:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 92 "hpricot_scan.rl"
+#line 98 "hpricot_scan.rl"
 	{
     if (text == 1) {
       CAT(tag, p);
@@ -728,7 +713,7 @@ st205:
 	if ( ++p == pe )
 		goto _test_eof205;
 case 205:
-#line 732 "hpricot_scan.c"
+#line 717 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 33: goto st0;
 		case 47: goto st59;
@@ -829,14 +814,14 @@ case 9:
 		goto tr12;
 	goto tr0;
 tr12:
-#line 104 "hpricot_scan.rl"
+#line 110 "hpricot_scan.rl"
 	{ mark_tag = p; }
 	goto st10;
 st10:
 	if ( ++p == pe )
 		goto _test_eof10;
 case 10:
-#line 840 "hpricot_scan.c"
+#line 825 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr13;
 		case 62: goto tr15;
@@ -860,14 +845,14 @@ case 10:
 		goto st10;
 	goto tr0;
 tr13:
-#line 107 "hpricot_scan.rl"
+#line 113 "hpricot_scan.rl"
 	{ SET(tag, p); }
 	goto st11;
 st11:
 	if ( ++p == pe )
 		goto _test_eof11;
 case 11:
-#line 871 "hpricot_scan.c"
+#line 856 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st11;
 		case 62: goto tr18;
@@ -957,14 +942,14 @@ case 19:
 		goto tr30;
 	goto tr0;
 tr30:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st20;
 st20:
 	if ( ++p == pe )
 		goto _test_eof20;
 case 20:
-#line 968 "hpricot_scan.c"
+#line 953 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 9: goto st20;
 		case 34: goto tr33;
@@ -984,20 +969,20 @@ case 20:
 		goto st20;
 	goto tr0;
 tr31:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 118 "hpricot_scan.rl"
+#line 124 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("public_id")), aval); }
 	goto st21;
 tr33:
-#line 118 "hpricot_scan.rl"
+#line 124 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("public_id")), aval); }
 	goto st21;
 st21:
 	if ( ++p == pe )
 		goto _test_eof21;
 case 21:
-#line 1001 "hpricot_scan.c"
+#line 986 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st22;
 		case 62: goto tr18;
@@ -1028,32 +1013,32 @@ case 23:
 		goto tr38;
 	goto tr37;
 tr37:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st24;
 st24:
 	if ( ++p == pe )
 		goto _test_eof24;
 case 24:
-#line 1039 "hpricot_scan.c"
+#line 1024 "hpricot_scan.c"
 	if ( (*p) == 34 )
 		goto tr41;
 	goto st24;
 tr38:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 119 "hpricot_scan.rl"
+#line 125 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("system_id")), aval); }
 	goto st25;
 tr41:
-#line 119 "hpricot_scan.rl"
+#line 125 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("system_id")), aval); }
 	goto st25;
 st25:
 	if ( ++p == pe )
 		goto _test_eof25;
 case 25:
-#line 1057 "hpricot_scan.c"
+#line 1042 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st25;
 		case 62: goto tr18;
@@ -1063,14 +1048,14 @@ case 25:
 		goto st25;
 	goto tr39;
 tr16:
-#line 107 "hpricot_scan.rl"
+#line 113 "hpricot_scan.rl"
 	{ SET(tag, p); }
 	goto st26;
 st26:
 	if ( ++p == pe )
 		goto _test_eof26;
 case 26:
-#line 1074 "hpricot_scan.c"
+#line 1059 "hpricot_scan.c"
 	if ( (*p) == 93 )
 		goto st27;
 	goto st26;
@@ -1093,14 +1078,14 @@ case 28:
 		goto tr38;
 	goto tr44;
 tr44:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st29;
 st29:
 	if ( ++p == pe )
 		goto _test_eof29;
 case 29:
-#line 1104 "hpricot_scan.c"
+#line 1089 "hpricot_scan.c"
 	if ( (*p) == 39 )
 		goto tr41;
 	goto st29;
@@ -1130,14 +1115,14 @@ case 30:
 		goto tr46;
 	goto tr0;
 tr46:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st31;
 st31:
 	if ( ++p == pe )
 		goto _test_eof31;
 case 31:
-#line 1141 "hpricot_scan.c"
+#line 1126 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 9: goto st31;
 		case 39: goto tr49;
@@ -1160,34 +1145,34 @@ case 31:
 		goto st31;
 	goto tr0;
 tr47:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 118 "hpricot_scan.rl"
+#line 124 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("public_id")), aval); }
 	goto st32;
 tr49:
-#line 118 "hpricot_scan.rl"
+#line 124 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("public_id")), aval); }
 	goto st32;
 tr55:
-#line 118 "hpricot_scan.rl"
+#line 124 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("public_id")), aval); }
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 119 "hpricot_scan.rl"
+#line 125 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("system_id")), aval); }
 	goto st32;
 tr82:
-#line 118 "hpricot_scan.rl"
+#line 124 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("public_id")), aval); }
-#line 119 "hpricot_scan.rl"
+#line 125 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("system_id")), aval); }
 	goto st32;
 st32:
 	if ( ++p == pe )
 		goto _test_eof32;
 case 32:
-#line 1191 "hpricot_scan.c"
+#line 1176 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 9: goto st33;
 		case 32: goto st33;
@@ -1241,20 +1226,20 @@ case 33:
 		goto st31;
 	goto tr0;
 tr51:
-#line 118 "hpricot_scan.rl"
+#line 124 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("public_id")), aval); }
 	goto st34;
 tr62:
-#line 118 "hpricot_scan.rl"
+#line 124 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("public_id")), aval); }
-#line 119 "hpricot_scan.rl"
+#line 125 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("system_id")), aval); }
 	goto st34;
 st34:
 	if ( ++p == pe )
 		goto _test_eof34;
 case 34:
-#line 1258 "hpricot_scan.c"
+#line 1243 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 9: goto tr52;
 		case 32: goto tr52;
@@ -1280,14 +1265,14 @@ case 34:
 		goto tr54;
 	goto tr44;
 tr52:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st35;
 st35:
 	if ( ++p == pe )
 		goto _test_eof35;
 case 35:
-#line 1291 "hpricot_scan.c"
+#line 1276 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 9: goto st35;
 		case 32: goto st35;
@@ -1313,14 +1298,14 @@ case 35:
 		goto st47;
 	goto st29;
 tr53:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st36;
 st36:
 	if ( ++p == pe )
 		goto _test_eof36;
 case 36:
-#line 1324 "hpricot_scan.c"
+#line 1309 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st36;
 		case 34: goto st37;
@@ -1341,38 +1326,38 @@ case 37:
 	}
 	goto tr66;
 tr66:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st38;
 st38:
 	if ( ++p == pe )
 		goto _test_eof38;
 case 38:
-#line 1352 "hpricot_scan.c"
+#line 1337 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 34: goto tr70;
 		case 39: goto tr71;
 	}
 	goto st38;
 tr81:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st39;
 tr67:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 119 "hpricot_scan.rl"
+#line 125 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("system_id")), aval); }
 	goto st39;
 tr70:
-#line 119 "hpricot_scan.rl"
+#line 125 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("system_id")), aval); }
 	goto st39;
 st39:
 	if ( ++p == pe )
 		goto _test_eof39;
 case 39:
-#line 1376 "hpricot_scan.c"
+#line 1361 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st39;
 		case 39: goto tr41;
@@ -1385,7 +1370,7 @@ case 39:
 tr56:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 #line 66 "hpricot_scan.rl"
 	{act = 8;}
@@ -1400,33 +1385,33 @@ st206:
 	if ( ++p == pe )
 		goto _test_eof206;
 case 206:
-#line 1404 "hpricot_scan.c"
+#line 1389 "hpricot_scan.c"
 	if ( (*p) == 39 )
 		goto tr41;
 	goto st29;
 tr57:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st40;
 st40:
 	if ( ++p == pe )
 		goto _test_eof40;
 case 40:
-#line 1416 "hpricot_scan.c"
+#line 1401 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 39: goto tr73;
 		case 93: goto st42;
 	}
 	goto st40;
 tr73:
-#line 119 "hpricot_scan.rl"
+#line 125 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("system_id")), aval); }
 	goto st41;
 st41:
 	if ( ++p == pe )
 		goto _test_eof41;
 case 41:
-#line 1430 "hpricot_scan.c"
+#line 1415 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st41;
 		case 62: goto tr76;
@@ -1445,7 +1430,7 @@ st207:
 	if ( ++p == pe )
 		goto _test_eof207;
 case 207:
-#line 1449 "hpricot_scan.c"
+#line 1434 "hpricot_scan.c"
 	if ( (*p) == 93 )
 		goto st27;
 	goto st26;
@@ -1462,20 +1447,20 @@ case 42:
 		goto st42;
 	goto st29;
 tr68:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 119 "hpricot_scan.rl"
+#line 125 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("system_id")), aval); }
 	goto st43;
 tr71:
-#line 119 "hpricot_scan.rl"
+#line 125 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("system_id")), aval); }
 	goto st43;
 st43:
 	if ( ++p == pe )
 		goto _test_eof43;
 case 43:
-#line 1479 "hpricot_scan.c"
+#line 1464 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st43;
 		case 34: goto tr41;
@@ -1495,7 +1480,7 @@ st208:
 	if ( ++p == pe )
 		goto _test_eof208;
 case 208:
-#line 1499 "hpricot_scan.c"
+#line 1484 "hpricot_scan.c"
 	if ( (*p) == 34 )
 		goto tr41;
 	goto st24;
@@ -1521,14 +1506,14 @@ case 45:
 		goto st45;
 	goto st24;
 tr65:
-#line 119 "hpricot_scan.rl"
+#line 125 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("system_id")), aval); }
 	goto st46;
 st46:
 	if ( ++p == pe )
 		goto _test_eof46;
 case 46:
-#line 1532 "hpricot_scan.c"
+#line 1517 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr81;
 		case 39: goto tr38;
@@ -1539,14 +1524,14 @@ case 46:
 		goto tr81;
 	goto tr44;
 tr54:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st47;
 st47:
 	if ( ++p == pe )
 		goto _test_eof47;
 case 47:
-#line 1550 "hpricot_scan.c"
+#line 1535 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 9: goto st47;
 		case 39: goto tr82;
@@ -1660,14 +1645,14 @@ case 59:
 		goto tr94;
 	goto tr0;
 tr94:
-#line 104 "hpricot_scan.rl"
+#line 110 "hpricot_scan.rl"
 	{ mark_tag = p; }
 	goto st60;
 st60:
 	if ( ++p == pe )
 		goto _test_eof60;
 case 60:
-#line 1671 "hpricot_scan.c"
+#line 1656 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr95;
 		case 62: goto tr97;
@@ -1690,14 +1675,14 @@ case 60:
 		goto st60;
 	goto tr0;
 tr95:
-#line 107 "hpricot_scan.rl"
+#line 113 "hpricot_scan.rl"
 	{ SET(tag, p); }
 	goto st61;
 st61:
 	if ( ++p == pe )
 		goto _test_eof61;
 case 61:
-#line 1701 "hpricot_scan.c"
+#line 1686 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st61;
 		case 62: goto tr99;
@@ -1706,14 +1691,14 @@ case 61:
 		goto st61;
 	goto tr0;
 tr417:
-#line 104 "hpricot_scan.rl"
+#line 110 "hpricot_scan.rl"
 	{ mark_tag = p; }
 	goto st62;
 st62:
 	if ( ++p == pe )
 		goto _test_eof62;
 case 62:
-#line 1717 "hpricot_scan.c"
+#line 1702 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr100;
 		case 47: goto tr102;
@@ -1734,14 +1719,14 @@ case 62:
 		goto st62;
 	goto tr0;
 tr100:
-#line 107 "hpricot_scan.rl"
+#line 113 "hpricot_scan.rl"
 	{ SET(tag, p); }
 	goto st63;
 st63:
 	if ( ++p == pe )
 		goto _test_eof63;
 case 63:
-#line 1745 "hpricot_scan.c"
+#line 1730 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st63;
 		case 47: goto st66;
@@ -1762,36 +1747,38 @@ case 63:
 		goto tr105;
 	goto tr0;
 tr105:
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st64;
 tr114:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st64;
 st64:
 	if ( ++p == pe )
 		goto _test_eof64;
 case 64:
-#line 1795 "hpricot_scan.c"
+#line 1782 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr108;
 		case 47: goto tr110;
@@ -1813,21 +1800,21 @@ case 64:
 		goto st64;
 	goto tr39;
 tr108:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st65;
 tr140:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st65;
 tr134:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -1836,7 +1823,7 @@ st65:
 	if ( ++p == pe )
 		goto _test_eof65;
 case 65:
-#line 1840 "hpricot_scan.c"
+#line 1827 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st65;
 		case 47: goto tr115;
@@ -1858,20 +1845,24 @@ case 65:
 		goto tr114;
 	goto tr39;
 tr102:
-#line 107 "hpricot_scan.rl"
+#line 113 "hpricot_scan.rl"
 	{ SET(tag, p); }
 	goto st66;
 tr110:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st66;
 tr115:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st66;
@@ -1879,19 +1870,19 @@ st66:
 	if ( ++p == pe )
 		goto _test_eof66;
 case 66:
-#line 1883 "hpricot_scan.c"
+#line 1874 "hpricot_scan.c"
 	if ( (*p) == 62 )
 		goto tr118;
 	goto tr39;
 tr111:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st67;
 st67:
 	if ( ++p == pe )
 		goto _test_eof67;
 case 67:
-#line 1895 "hpricot_scan.c"
+#line 1886 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr120;
 		case 32: goto tr120;
@@ -1908,14 +1899,14 @@ case 67:
 		goto tr120;
 	goto tr119;
 tr119:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st68;
 st68:
 	if ( ++p == pe )
 		goto _test_eof68;
 case 68:
-#line 1919 "hpricot_scan.c"
+#line 1910 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr126;
 		case 32: goto tr126;
@@ -1930,27 +1921,27 @@ case 68:
 		goto tr126;
 	goto st68;
 tr126:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st69;
 tr331:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st69;
 tr169:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st69;
 st69:
 	if ( ++p == pe )
 		goto _test_eof69;
 case 69:
-#line 1954 "hpricot_scan.c"
+#line 1945 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st69;
 		case 47: goto tr115;
@@ -1971,27 +1962,27 @@ case 69:
 		goto tr114;
 	goto tr39;
 tr127:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st70;
 tr155:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st70;
 tr163:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st70;
 st70:
 	if ( ++p == pe )
 		goto _test_eof70;
 case 70:
-#line 1995 "hpricot_scan.c"
+#line 1986 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr126;
 		case 32: goto tr126;
@@ -2017,42 +2008,46 @@ case 70:
 		goto tr131;
 	goto st68;
 tr131:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st71;
 tr150:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st71;
 st71:
 	if ( ++p == pe )
 		goto _test_eof71;
 case 71:
-#line 2056 "hpricot_scan.c"
+#line 2051 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr134;
 		case 32: goto tr134;
@@ -2079,17 +2074,17 @@ case 71:
 		goto st71;
 	goto st68;
 tr141:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st72;
 tr135:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -2098,7 +2093,7 @@ st72:
 	if ( ++p == pe )
 		goto _test_eof72;
 case 72:
-#line 2102 "hpricot_scan.c"
+#line 2097 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr140;
 		case 32: goto tr140;
@@ -2125,70 +2120,82 @@ case 72:
 		goto tr131;
 	goto st68;
 tr124:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st73;
 tr128:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st73;
 tr132:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st73;
 tr137:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st73;
 tr147:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st73;
 tr151:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -2197,7 +2204,7 @@ st73:
 	if ( ++p == pe )
 		goto _test_eof73;
 case 73:
-#line 2201 "hpricot_scan.c"
+#line 2208 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr126;
 		case 32: goto tr126;
@@ -2212,18 +2219,18 @@ case 73:
 		goto tr126;
 	goto st68;
 tr121:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st74;
 tr138:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st74;
 st74:
 	if ( ++p == pe )
 		goto _test_eof74;
 case 74:
-#line 2227 "hpricot_scan.c"
+#line 2234 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr143;
 		case 32: goto tr143;
@@ -2240,14 +2247,14 @@ case 74:
 		goto tr143;
 	goto tr119;
 tr148:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st75;
 tr143:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -2256,7 +2263,7 @@ st75:
 	if ( ++p == pe )
 		goto _test_eof75;
 case 75:
-#line 2260 "hpricot_scan.c"
+#line 2267 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr148;
 		case 32: goto tr148;
@@ -2284,14 +2291,14 @@ case 75:
 		goto tr150;
 	goto tr119;
 tr149:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st76;
 tr144:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -2300,7 +2307,7 @@ st76:
 	if ( ++p == pe )
 		goto _test_eof76;
 case 76:
-#line 2304 "hpricot_scan.c"
+#line 2311 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr143;
 		case 32: goto tr143;
@@ -2347,14 +2354,14 @@ case 77:
 		goto tr153;
 	goto tr152;
 tr152:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st78;
 st78:
 	if ( ++p == pe )
 		goto _test_eof78;
 case 78:
-#line 2358 "hpricot_scan.c"
+#line 2365 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr161;
 		case 32: goto tr161;
@@ -2371,40 +2378,40 @@ case 78:
 		goto tr161;
 	goto st78;
 tr336:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st79;
 tr161:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st79;
 tr153:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st79;
 tr317:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st79;
 tr174:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st79;
 st79:
 	if ( ++p == pe )
 		goto _test_eof79;
 case 79:
-#line 2408 "hpricot_scan.c"
+#line 2415 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st79;
 		case 34: goto tr169;
@@ -2427,70 +2434,74 @@ case 79:
 		goto tr170;
 	goto st80;
 tr157:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st80;
 st80:
 	if ( ++p == pe )
 		goto _test_eof80;
 case 80:
-#line 2438 "hpricot_scan.c"
+#line 2445 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 34: goto tr169;
 		case 92: goto st81;
 	}
 	goto st80;
 tr340:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st81;
 st81:
 	if ( ++p == pe )
 		goto _test_eof81;
 case 81:
-#line 2452 "hpricot_scan.c"
+#line 2459 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 34: goto tr174;
 		case 92: goto st81;
 	}
 	goto st80;
 tr170:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st82;
 tr337:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st82;
 st82:
 	if ( ++p == pe )
 		goto _test_eof82;
 case 82:
-#line 2494 "hpricot_scan.c"
+#line 2505 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr175;
 		case 34: goto tr169;
@@ -2514,21 +2525,21 @@ case 82:
 		goto st82;
 	goto st80;
 tr175:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st83;
 tr206:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st83;
 tr200:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -2537,7 +2548,7 @@ st83:
 	if ( ++p == pe )
 		goto _test_eof83;
 case 83:
-#line 2541 "hpricot_scan.c"
+#line 2552 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st83;
 		case 34: goto tr169;
@@ -2561,24 +2572,30 @@ case 83:
 		goto tr170;
 	goto st80;
 tr177:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st84;
 tr171:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st84;
 tr338:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st84;
@@ -2586,7 +2603,7 @@ st84:
 	if ( ++p == pe )
 		goto _test_eof84;
 case 84:
-#line 2590 "hpricot_scan.c"
+#line 2607 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 34: goto tr169;
 		case 62: goto tr182;
@@ -2596,15 +2613,17 @@ case 84:
 tr158:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -2613,13 +2632,15 @@ tr158:
 tr166:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -2628,8 +2649,10 @@ tr166:
 tr172:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -2638,10 +2661,12 @@ tr172:
 tr179:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -2656,12 +2681,14 @@ tr182:
 tr196:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -2671,14 +2698,16 @@ tr196:
 tr197:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -2688,15 +2717,17 @@ tr197:
 tr205:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -2705,10 +2736,12 @@ tr205:
 tr339:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -2718,21 +2751,21 @@ st209:
 	if ( ++p == pe )
 		goto _test_eof209;
 case 209:
-#line 2722 "hpricot_scan.c"
+#line 2755 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 34: goto tr169;
 		case 92: goto st81;
 	}
 	goto st80;
 tr178:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st85;
 st85:
 	if ( ++p == pe )
 		goto _test_eof85;
 case 85:
-#line 2736 "hpricot_scan.c"
+#line 2769 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr183;
 		case 32: goto tr183;
@@ -2750,14 +2783,14 @@ case 85:
 		goto tr183;
 	goto tr152;
 tr183:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st86;
 st86:
 	if ( ++p == pe )
 		goto _test_eof86;
 case 86:
-#line 2761 "hpricot_scan.c"
+#line 2794 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr188;
 		case 32: goto tr188;
@@ -2775,14 +2808,14 @@ case 86:
 		goto tr188;
 	goto tr152;
 tr188:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st87;
 tr191:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -2791,7 +2824,7 @@ st87:
 	if ( ++p == pe )
 		goto _test_eof87;
 case 87:
-#line 2795 "hpricot_scan.c"
+#line 2828 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr188;
 		case 32: goto tr188;
@@ -2820,14 +2853,14 @@ case 87:
 		goto tr190;
 	goto tr152;
 tr189:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st88;
 tr192:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -2836,7 +2869,7 @@ st88:
 	if ( ++p == pe )
 		goto _test_eof88;
 case 88:
-#line 2840 "hpricot_scan.c"
+#line 2873 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr191;
 		case 32: goto tr191;
@@ -2865,14 +2898,14 @@ case 88:
 		goto tr190;
 	goto tr152;
 tr193:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st89;
 st89:
 	if ( ++p == pe )
 		goto _test_eof89;
 case 89:
-#line 2876 "hpricot_scan.c"
+#line 2909 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr153;
 		case 32: goto tr153;
@@ -2900,36 +2933,36 @@ case 89:
 		goto tr190;
 	goto tr152;
 tr162:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st90;
 tr154:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st90;
 tr214:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st90;
 tr209:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st90;
 st90:
 	if ( ++p == pe )
 		goto _test_eof90;
 case 90:
-#line 2933 "hpricot_scan.c"
+#line 2966 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr161;
 		case 32: goto tr161;
@@ -2957,42 +2990,46 @@ case 90:
 		goto tr198;
 	goto st78;
 tr198:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st91;
 tr190:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st91;
 st91:
 	if ( ++p == pe )
 		goto _test_eof91;
 case 91:
-#line 2996 "hpricot_scan.c"
+#line 3033 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr200;
 		case 32: goto tr200;
@@ -3021,17 +3058,17 @@ case 91:
 		goto st91;
 	goto st78;
 tr207:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st92;
 tr201:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -3040,7 +3077,7 @@ st92:
 	if ( ++p == pe )
 		goto _test_eof92;
 case 92:
-#line 3044 "hpricot_scan.c"
+#line 3081 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr206;
 		case 32: goto tr206;
@@ -3069,70 +3106,82 @@ case 92:
 		goto tr198;
 	goto st78;
 tr187:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st93;
 tr164:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st93;
 tr199:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st93;
 tr203:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st93;
 tr156:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st93;
 tr195:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -3141,7 +3190,7 @@ st93:
 	if ( ++p == pe )
 		goto _test_eof93;
 case 93:
-#line 3145 "hpricot_scan.c"
+#line 3194 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr161;
 		case 32: goto tr161;
@@ -3158,14 +3207,14 @@ case 93:
 		goto tr161;
 	goto st78;
 tr159:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st94;
 st94:
 	if ( ++p == pe )
 		goto _test_eof94;
 case 94:
-#line 3169 "hpricot_scan.c"
+#line 3218 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr161;
 		case 32: goto tr161;
@@ -3182,18 +3231,18 @@ case 94:
 		goto tr161;
 	goto st78;
 tr184:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st95;
 tr204:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st95;
 st95:
 	if ( ++p == pe )
 		goto _test_eof95;
 case 95:
-#line 3197 "hpricot_scan.c"
+#line 3246 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr191;
 		case 32: goto tr191;
@@ -3231,14 +3280,14 @@ case 96:
 		goto tr211;
 	goto tr210;
 tr210:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st97;
 st97:
 	if ( ++p == pe )
 		goto _test_eof97;
 case 97:
-#line 3242 "hpricot_scan.c"
+#line 3291 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr220;
 		case 32: goto tr220;
@@ -3256,34 +3305,34 @@ case 97:
 		goto tr220;
 	goto st97;
 tr315:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st98;
 tr220:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st98;
 tr211:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st98;
 tr299:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st98;
 st98:
 	if ( ++p == pe )
 		goto _test_eof98;
 case 98:
-#line 3287 "hpricot_scan.c"
+#line 3336 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st98;
 		case 34: goto tr228;
@@ -3307,14 +3356,14 @@ case 98:
 		goto tr229;
 	goto st99;
 tr216:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st99;
 st99:
 	if ( ++p == pe )
 		goto _test_eof99;
 case 99:
-#line 3318 "hpricot_scan.c"
+#line 3367 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 34: goto tr228;
 		case 39: goto tr174;
@@ -3322,46 +3371,46 @@ case 99:
 	}
 	goto st99;
 tr330:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st100;
 tr255:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st100;
 tr326:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st100;
 tr316:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st100;
 tr228:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st100;
 tr322:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st100;
 st100:
 	if ( ++p == pe )
 		goto _test_eof100;
 case 100:
-#line 3365 "hpricot_scan.c"
+#line 3414 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st100;
 		case 39: goto tr169;
@@ -3384,70 +3433,74 @@ case 100:
 		goto tr235;
 	goto st101;
 tr328:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st101;
 st101:
 	if ( ++p == pe )
 		goto _test_eof101;
 case 101:
-#line 3395 "hpricot_scan.c"
+#line 3444 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 39: goto tr169;
 		case 92: goto st102;
 	}
 	goto st101;
 tr335:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st102;
 st102:
 	if ( ++p == pe )
 		goto _test_eof102;
 case 102:
-#line 3409 "hpricot_scan.c"
+#line 3458 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 39: goto tr228;
 		case 92: goto st102;
 	}
 	goto st101;
 tr235:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st103;
 tr332:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st103;
 st103:
 	if ( ++p == pe )
 		goto _test_eof103;
 case 103:
-#line 3451 "hpricot_scan.c"
+#line 3504 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr239;
 		case 39: goto tr169;
@@ -3471,21 +3524,21 @@ case 103:
 		goto st103;
 	goto st101;
 tr239:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st104;
 tr269:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st104;
 tr263:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -3494,7 +3547,7 @@ st104:
 	if ( ++p == pe )
 		goto _test_eof104;
 case 104:
-#line 3498 "hpricot_scan.c"
+#line 3551 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st104;
 		case 39: goto tr169;
@@ -3518,24 +3571,30 @@ case 104:
 		goto tr235;
 	goto st101;
 tr241:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st105;
 tr236:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st105;
 tr333:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st105;
@@ -3543,7 +3602,7 @@ st105:
 	if ( ++p == pe )
 		goto _test_eof105;
 case 105:
-#line 3547 "hpricot_scan.c"
+#line 3606 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 39: goto tr169;
 		case 62: goto tr246;
@@ -3553,15 +3612,17 @@ case 105:
 tr341:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -3570,13 +3631,15 @@ tr341:
 tr258:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -3585,8 +3648,10 @@ tr258:
 tr237:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -3595,10 +3660,12 @@ tr237:
 tr243:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -3613,12 +3680,14 @@ tr246:
 tr262:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -3628,14 +3697,16 @@ tr262:
 tr329:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -3645,15 +3716,17 @@ tr329:
 tr268:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -3662,10 +3735,12 @@ tr268:
 tr334:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -3675,21 +3750,21 @@ st210:
 	if ( ++p == pe )
 		goto _test_eof210;
 case 210:
-#line 3679 "hpricot_scan.c"
+#line 3754 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 39: goto tr169;
 		case 92: goto st102;
 	}
 	goto st101;
 tr242:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st106;
 st106:
 	if ( ++p == pe )
 		goto _test_eof106;
 case 106:
-#line 3693 "hpricot_scan.c"
+#line 3768 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr248;
 		case 32: goto tr248;
@@ -3707,14 +3782,14 @@ case 106:
 		goto tr248;
 	goto tr247;
 tr247:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st107;
 st107:
 	if ( ++p == pe )
 		goto _test_eof107;
 case 107:
-#line 3718 "hpricot_scan.c"
+#line 3793 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr255;
 		case 32: goto tr255;
@@ -3731,42 +3806,42 @@ case 107:
 		goto tr255;
 	goto st107;
 tr256:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st108;
 tr327:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st108;
 tr281:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st108;
 tr222:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st108;
 tr213:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st108;
 st108:
 	if ( ++p == pe )
 		goto _test_eof108;
 case 108:
-#line 3770 "hpricot_scan.c"
+#line 3845 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr255;
 		case 32: goto tr255;
@@ -3794,42 +3869,46 @@ case 108:
 		goto tr260;
 	goto st107;
 tr260:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st109;
 tr279:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st109;
 st109:
 	if ( ++p == pe )
 		goto _test_eof109;
 case 109:
-#line 3833 "hpricot_scan.c"
+#line 3912 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr263;
 		case 32: goto tr263;
@@ -3858,17 +3937,17 @@ case 109:
 		goto st109;
 	goto st107;
 tr270:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st110;
 tr264:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -3877,7 +3956,7 @@ st110:
 	if ( ++p == pe )
 		goto _test_eof110;
 case 110:
-#line 3881 "hpricot_scan.c"
+#line 3960 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr269;
 		case 32: goto tr269;
@@ -3906,70 +3985,82 @@ case 110:
 		goto tr260;
 	goto st107;
 tr252:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st111;
 tr257:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st111;
 tr261:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st111;
 tr266:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st111;
 tr276:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st111;
 tr280:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -3978,7 +4069,7 @@ st111:
 	if ( ++p == pe )
 		goto _test_eof111;
 case 111:
-#line 3982 "hpricot_scan.c"
+#line 4073 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr255;
 		case 32: goto tr255;
@@ -3995,14 +4086,14 @@ case 111:
 		goto tr255;
 	goto st107;
 tr253:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st112;
 st112:
 	if ( ++p == pe )
 		goto _test_eof112;
 case 112:
-#line 4006 "hpricot_scan.c"
+#line 4097 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr255;
 		case 32: goto tr255;
@@ -4019,18 +4110,18 @@ case 112:
 		goto tr255;
 	goto st107;
 tr249:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st113;
 tr267:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st113;
 st113:
 	if ( ++p == pe )
 		goto _test_eof113;
 case 113:
-#line 4034 "hpricot_scan.c"
+#line 4125 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr272;
 		case 32: goto tr272;
@@ -4048,14 +4139,14 @@ case 113:
 		goto tr272;
 	goto tr247;
 tr277:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st114;
 tr272:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -4064,7 +4155,7 @@ st114:
 	if ( ++p == pe )
 		goto _test_eof114;
 case 114:
-#line 4068 "hpricot_scan.c"
+#line 4159 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr277;
 		case 32: goto tr277;
@@ -4093,14 +4184,14 @@ case 114:
 		goto tr279;
 	goto tr247;
 tr278:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st115;
 tr273:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -4109,7 +4200,7 @@ st115:
 	if ( ++p == pe )
 		goto _test_eof115;
 case 115:
-#line 4113 "hpricot_scan.c"
+#line 4204 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr272;
 		case 32: goto tr272;
@@ -4158,30 +4249,30 @@ case 116:
 		goto tr211;
 	goto tr210;
 tr221:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st117;
 tr212:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st117;
 tr314:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st117;
 st117:
 	if ( ++p == pe )
 		goto _test_eof117;
 case 117:
-#line 4185 "hpricot_scan.c"
+#line 4276 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr220;
 		case 32: goto tr220;
@@ -4210,42 +4301,46 @@ case 117:
 		goto tr282;
 	goto st97;
 tr282:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st118;
 tr307:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st118;
 st118:
 	if ( ++p == pe )
 		goto _test_eof118;
 case 118:
-#line 4249 "hpricot_scan.c"
+#line 4344 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr285;
 		case 32: goto tr285;
@@ -4275,21 +4370,21 @@ case 118:
 		goto st118;
 	goto st97;
 tr293:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st119;
 tr323:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st119;
 tr285:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -4298,7 +4393,7 @@ st119:
 	if ( ++p == pe )
 		goto _test_eof119;
 case 119:
-#line 4302 "hpricot_scan.c"
+#line 4397 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st119;
 		case 34: goto tr228;
@@ -4323,42 +4418,46 @@ case 119:
 		goto tr229;
 	goto st99;
 tr229:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st120;
 tr318:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 121 "hpricot_scan.rl"
-	{ 
+#line 127 "hpricot_scan.rl"
+	{
     akey = Qnil;
     aval = Qnil;
     mark_akey = NULL;
     mark_aval = NULL;
   }
-#line 106 "hpricot_scan.rl"
+#line 112 "hpricot_scan.rl"
 	{ mark_akey = p; }
 	goto st120;
 st120:
 	if ( ++p == pe )
 		goto _test_eof120;
 case 120:
-#line 4362 "hpricot_scan.c"
+#line 4461 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr293;
 		case 34: goto tr228;
@@ -4383,24 +4482,30 @@ case 120:
 		goto st120;
 	goto st99;
 tr295:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st121;
 tr230:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st121;
 tr319:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st121;
@@ -4408,7 +4513,7 @@ st121:
 	if ( ++p == pe )
 		goto _test_eof121;
 case 121:
-#line 4412 "hpricot_scan.c"
+#line 4517 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 34: goto tr228;
 		case 39: goto tr174;
@@ -4419,15 +4524,17 @@ case 121:
 tr217:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -4436,13 +4543,15 @@ tr217:
 tr225:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -4451,8 +4560,10 @@ tr225:
 tr231:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -4461,10 +4572,12 @@ tr231:
 tr297:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -4479,12 +4592,14 @@ tr298:
 tr284:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -4494,14 +4609,16 @@ tr284:
 tr313:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -4511,15 +4628,17 @@ tr313:
 tr290:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -4528,10 +4647,12 @@ tr290:
 tr320:
 #line 1 "hpricot_scan.rl"
 	{te = p+1;}
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 #line 68 "hpricot_scan.rl"
@@ -4541,7 +4662,7 @@ st211:
 	if ( ++p == pe )
 		goto _test_eof211;
 case 211:
-#line 4545 "hpricot_scan.c"
+#line 4666 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 34: goto tr228;
 		case 39: goto tr174;
@@ -4549,14 +4670,14 @@ case 211:
 	}
 	goto st99;
 tr321:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st122;
 st122:
 	if ( ++p == pe )
 		goto _test_eof122;
 case 122:
-#line 4560 "hpricot_scan.c"
+#line 4681 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 34: goto tr299;
 		case 39: goto tr299;
@@ -4564,14 +4685,14 @@ case 122:
 	}
 	goto st99;
 tr296:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st123;
 st123:
 	if ( ++p == pe )
 		goto _test_eof123;
 case 123:
-#line 4575 "hpricot_scan.c"
+#line 4696 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr300;
 		case 32: goto tr300;
@@ -4589,14 +4710,14 @@ case 123:
 		goto tr300;
 	goto tr210;
 tr300:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st124;
 st124:
 	if ( ++p == pe )
 		goto _test_eof124;
 case 124:
-#line 4600 "hpricot_scan.c"
+#line 4721 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr305;
 		case 32: goto tr305;
@@ -4614,14 +4735,14 @@ case 124:
 		goto tr305;
 	goto tr210;
 tr305:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st125;
 tr308:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -4630,7 +4751,7 @@ st125:
 	if ( ++p == pe )
 		goto _test_eof125;
 case 125:
-#line 4634 "hpricot_scan.c"
+#line 4755 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr305;
 		case 32: goto tr305;
@@ -4659,14 +4780,14 @@ case 125:
 		goto tr307;
 	goto tr210;
 tr306:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st126;
 tr309:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -4675,7 +4796,7 @@ st126:
 	if ( ++p == pe )
 		goto _test_eof126;
 case 126:
-#line 4679 "hpricot_scan.c"
+#line 4800 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr308;
 		case 32: goto tr308;
@@ -4704,14 +4825,14 @@ case 126:
 		goto tr307;
 	goto tr210;
 tr310:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st127;
 st127:
 	if ( ++p == pe )
 		goto _test_eof127;
 case 127:
-#line 4715 "hpricot_scan.c"
+#line 4836 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr211;
 		case 32: goto tr211;
@@ -4740,70 +4861,82 @@ case 127:
 		goto tr307;
 	goto tr210;
 tr304:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st128;
 tr223:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st128;
 tr283:
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st128;
 tr288:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st128;
 tr215:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
 	goto st128;
 tr312:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
-#line 128 "hpricot_scan.rl"
-	{ 
+#line 134 "hpricot_scan.rl"
+	{
+    if (!S->xml)
+      akey = rb_funcall(akey, s_downcase, 0);
     ATTR(akey, aval);
   }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -4812,7 +4945,7 @@ st128:
 	if ( ++p == pe )
 		goto _test_eof128;
 case 128:
-#line 4816 "hpricot_scan.c"
+#line 4949 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr220;
 		case 32: goto tr220;
@@ -4830,14 +4963,14 @@ case 128:
 		goto tr220;
 	goto st97;
 tr218:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st129;
 st129:
 	if ( ++p == pe )
 		goto _test_eof129;
 case 129:
-#line 4841 "hpricot_scan.c"
+#line 4974 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr220;
 		case 32: goto tr220;
@@ -4855,14 +4988,14 @@ case 129:
 		goto tr220;
 	goto st97;
 tr311:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st130;
 st130:
 	if ( ++p == pe )
 		goto _test_eof130;
 case 130:
-#line 4866 "hpricot_scan.c"
+#line 4999 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr211;
 		case 32: goto tr211;
@@ -4891,14 +5024,14 @@ case 130:
 		goto tr307;
 	goto tr210;
 tr302:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st131;
 st131:
 	if ( ++p == pe )
 		goto _test_eof131;
 case 131:
-#line 4902 "hpricot_scan.c"
+#line 5035 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr315;
 		case 34: goto tr316;
@@ -4922,14 +5055,14 @@ case 131:
 		goto tr318;
 	goto tr216;
 tr303:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st132;
 st132:
 	if ( ++p == pe )
 		goto _test_eof132;
 case 132:
-#line 4933 "hpricot_scan.c"
+#line 5066 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr315;
 		case 34: goto tr322;
@@ -4953,18 +5086,18 @@ case 132:
 		goto tr318;
 	goto tr216;
 tr301:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st133;
 tr289:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
 	goto st133;
 st133:
 	if ( ++p == pe )
 		goto _test_eof133;
 case 133:
-#line 4968 "hpricot_scan.c"
+#line 5101 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr308;
 		case 32: goto tr308;
@@ -4982,17 +5115,17 @@ case 133:
 		goto tr308;
 	goto tr210;
 tr324:
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
 	goto st134;
 tr286:
-#line 114 "hpricot_scan.rl"
+#line 120 "hpricot_scan.rl"
 	{ SET(akey, p); }
-#line 110 "hpricot_scan.rl"
-	{ 
+#line 116 "hpricot_scan.rl"
+	{
     if (*(p-1) == '"' || *(p-1) == '\'') { SET(aval, p-1); }
     else { SET(aval, p); }
   }
@@ -5001,7 +5134,7 @@ st134:
 	if ( ++p == pe )
 		goto _test_eof134;
 case 134:
-#line 5005 "hpricot_scan.c"
+#line 5138 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr323;
 		case 32: goto tr323;
@@ -5031,14 +5164,14 @@ case 134:
 		goto tr282;
 	goto st97;
 tr275:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st135;
 st135:
 	if ( ++p == pe )
 		goto _test_eof135;
 case 135:
-#line 5042 "hpricot_scan.c"
+#line 5175 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr326;
 		case 32: goto tr326;
@@ -5076,14 +5209,14 @@ case 136:
 	}
 	goto tr216;
 tr251:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st137;
 st137:
 	if ( ++p == pe )
 		goto _test_eof137;
 case 137:
-#line 5087 "hpricot_scan.c"
+#line 5220 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr330;
 		case 39: goto tr331;
@@ -5106,14 +5239,14 @@ case 137:
 		goto tr332;
 	goto tr328;
 tr248:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st138;
 st138:
 	if ( ++p == pe )
 		goto _test_eof138;
 case 138:
-#line 5117 "hpricot_scan.c"
+#line 5250 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr277;
 		case 32: goto tr277;
@@ -5131,14 +5264,14 @@ case 138:
 		goto tr277;
 	goto tr247;
 tr185:
-#line 109 "hpricot_scan.rl"
+#line 115 "hpricot_scan.rl"
 	{ SET(aval, p); }
 	goto st139;
 st139:
 	if ( ++p == pe )
 		goto _test_eof139;
 case 139:
-#line 5142 "hpricot_scan.c"
+#line 5275 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr336;
 		case 34: goto tr331;
@@ -5208,14 +5341,14 @@ case 143:
 	}
 	goto tr328;
 tr120:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st144;
 st144:
 	if ( ++p == pe )
 		goto _test_eof144;
 case 144:
-#line 5219 "hpricot_scan.c"
+#line 5352 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 13: goto tr148;
 		case 32: goto tr148;
@@ -5254,7 +5387,7 @@ st146:
 	if ( ++p == pe )
 		goto _test_eof146;
 case 146:
-#line 5258 "hpricot_scan.c"
+#line 5391 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st212;
 		case 63: goto st146;
@@ -5292,7 +5425,7 @@ st147:
 	if ( ++p == pe )
 		goto _test_eof147;
 case 147:
-#line 5296 "hpricot_scan.c"
+#line 5429 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st212;
 		case 63: goto st146;
@@ -5371,7 +5504,7 @@ st213:
 	if ( ++p == pe )
 		goto _test_eof213;
 case 213:
-#line 5375 "hpricot_scan.c"
+#line 5508 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto tr348;
 		case 118: goto st150;
@@ -5463,14 +5596,14 @@ case 158:
 		goto tr359;
 	goto tr349;
 tr359:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st159;
 st159:
 	if ( ++p == pe )
 		goto _test_eof159;
 case 159:
-#line 5474 "hpricot_scan.c"
+#line 5607 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 34: goto tr360;
 		case 95: goto st159;
@@ -5488,14 +5621,14 @@ case 159:
 		goto st159;
 	goto tr349;
 tr360:
-#line 115 "hpricot_scan.rl"
+#line 121 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("version")), aval); }
 	goto st160;
 st160:
 	if ( ++p == pe )
 		goto _test_eof160;
 case 160:
-#line 5499 "hpricot_scan.c"
+#line 5632 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st161;
 		case 62: goto tr363;
@@ -5608,14 +5741,14 @@ case 172:
 		goto tr377;
 	goto tr349;
 tr377:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st173;
 st173:
 	if ( ++p == pe )
 		goto _test_eof173;
 case 173:
-#line 5619 "hpricot_scan.c"
+#line 5752 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 34: goto tr378;
 		case 95: goto st173;
@@ -5633,14 +5766,14 @@ case 173:
 		goto st173;
 	goto tr349;
 tr378:
-#line 116 "hpricot_scan.rl"
+#line 122 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("encoding")), aval); }
 	goto st174;
 st174:
 	if ( ++p == pe )
 		goto _test_eof174;
 case 174:
-#line 5644 "hpricot_scan.c"
+#line 5777 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st175;
 		case 62: goto tr363;
@@ -5758,14 +5891,14 @@ case 187:
 	}
 	goto tr349;
 tr393:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st188;
 st188:
 	if ( ++p == pe )
 		goto _test_eof188;
 case 188:
-#line 5769 "hpricot_scan.c"
+#line 5902 "hpricot_scan.c"
 	if ( (*p) == 111 )
 		goto st189;
 	goto tr349;
@@ -5777,14 +5910,14 @@ case 189:
 		goto tr396;
 	goto tr349;
 tr396:
-#line 117 "hpricot_scan.rl"
+#line 123 "hpricot_scan.rl"
 	{ SET(aval, p); ATTR(ID2SYM(rb_intern("standalone")), aval); }
 	goto st190;
 st190:
 	if ( ++p == pe )
 		goto _test_eof190;
 case 190:
-#line 5788 "hpricot_scan.c"
+#line 5921 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 32: goto st190;
 		case 62: goto tr363;
@@ -5794,14 +5927,14 @@ case 190:
 		goto st190;
 	goto tr349;
 tr394:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st191;
 st191:
 	if ( ++p == pe )
 		goto _test_eof191;
 case 191:
-#line 5805 "hpricot_scan.c"
+#line 5938 "hpricot_scan.c"
 	if ( (*p) == 101 )
 		goto st192;
 	goto tr349;
@@ -5822,14 +5955,14 @@ case 193:
 	}
 	goto tr349;
 tr399:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st194;
 st194:
 	if ( ++p == pe )
 		goto _test_eof194;
 case 194:
-#line 5833 "hpricot_scan.c"
+#line 5966 "hpricot_scan.c"
 	if ( (*p) == 111 )
 		goto st195;
 	goto tr349;
@@ -5841,14 +5974,14 @@ case 195:
 		goto tr396;
 	goto tr349;
 tr400:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st196;
 st196:
 	if ( ++p == pe )
 		goto _test_eof196;
 case 196:
-#line 5852 "hpricot_scan.c"
+#line 5985 "hpricot_scan.c"
 	if ( (*p) == 101 )
 		goto st197;
 	goto tr349;
@@ -5870,14 +6003,14 @@ case 198:
 		goto tr403;
 	goto tr349;
 tr403:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st199;
 st199:
 	if ( ++p == pe )
 		goto _test_eof199;
 case 199:
-#line 5881 "hpricot_scan.c"
+#line 6014 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 39: goto tr378;
 		case 95: goto st199;
@@ -5913,14 +6046,14 @@ case 200:
 		goto tr405;
 	goto tr349;
 tr405:
-#line 105 "hpricot_scan.rl"
+#line 111 "hpricot_scan.rl"
 	{ mark_aval = p; }
 	goto st201;
 st201:
 	if ( ++p == pe )
 		goto _test_eof201;
 case 201:
-#line 5924 "hpricot_scan.c"
+#line 6057 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 39: goto tr360;
 		case 95: goto st201;
@@ -5969,7 +6102,7 @@ st214:
 case 214:
 #line 1 "hpricot_scan.rl"
 	{ts = p;}
-#line 5973 "hpricot_scan.c"
+#line 6106 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 10: goto tr423;
 		case 45: goto tr424;
@@ -5983,7 +6116,7 @@ st215:
 	if ( ++p == pe )
 		goto _test_eof215;
 case 215:
-#line 5987 "hpricot_scan.c"
+#line 6120 "hpricot_scan.c"
 	if ( (*p) == 45 )
 		goto st202;
 	goto tr425;
@@ -6026,7 +6159,7 @@ st216:
 case 216:
 #line 1 "hpricot_scan.rl"
 	{ts = p;}
-#line 6030 "hpricot_scan.c"
+#line 6163 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 10: goto tr428;
 		case 93: goto tr429;
@@ -6040,7 +6173,7 @@ st217:
 	if ( ++p == pe )
 		goto _test_eof217;
 case 217:
-#line 6044 "hpricot_scan.c"
+#line 6177 "hpricot_scan.c"
 	if ( (*p) == 93 )
 		goto st203;
 	goto tr430;
@@ -6079,7 +6212,7 @@ st218:
 case 218:
 #line 1 "hpricot_scan.rl"
 	{ts = p;}
-#line 6083 "hpricot_scan.c"
+#line 6216 "hpricot_scan.c"
 	switch( (*p) ) {
 		case 10: goto tr433;
 		case 62: goto tr434;
@@ -6539,11 +6672,13 @@ case 219:
 	}
 
 	}
-#line 561 "hpricot_scan.rl"
-    
-    if ( cs == hpricot_scan_error ) {
-      free(buf);
-      if ( !NIL_P(tag) )
+
+#line 534 "hpricot_scan.rl"
+
+    if (cs == hpricot_scan_error) {
+      if (buf != NULL)
+        free(buf);
+      if (!NIL_P(tag))
       {
         rb_raise(rb_eHpricotParseError, "parse error on element <%s>, starting on line %d.\n" NO_WAY_SERIOUSLY, RSTRING_PTR(tag), curline);
       }
@@ -6552,8 +6687,8 @@ case 219:
         rb_raise(rb_eHpricotParseError, "parse error on line %d.\n" NO_WAY_SERIOUSLY, curline);
       }
     }
-    
-    if ( done && ele_open )
+
+    if (done && ele_open)
     {
       ele_open = 0;
       if (ts > 0) {
@@ -6563,11 +6698,11 @@ case 219:
       }
     }
 
-    if ( ts == 0 )
+    if (ts == 0)
     {
       have = 0;
       /* text nodes have no ts because each byte is parsed alone */
-      if ( mark_tag != NULL && text == 1 )
+      if (mark_tag != NULL && text == 1)
       {
         if (done)
         {
@@ -6582,12 +6717,15 @@ case 219:
           CAT(tag, p);
         }
       }
-      mark_tag = buf;
+      if (io)
+        mark_tag = buf;
+      else
+        mark_tag = RSTRING_PTR(port);
     }
-    else
+    else if (io)
     {
       have = pe - ts;
-      memmove( buf, ts, have );
+      memmove(buf, ts, have);
       SLIDE(tag);
       SLIDE(akey);
       SLIDE(aval);
@@ -6595,7 +6733,9 @@ case 219:
       ts = buf;
     }
   }
-  free(buf);
+
+  if (buf != NULL)
+    free(buf);
 
   if (S != NULL)
   {
@@ -6608,66 +6748,103 @@ case 219:
   return Qnil;
 }
 
+static VALUE
+alloc_hpricot_struct(VALUE klass)
+{
+  VALUE size;
+  long n;
+  NEWOBJ(st, struct RStruct);
+  OBJSETUP(st, klass, T_STRUCT);
+
+  size = rb_struct_iv_get(klass, "__size__");
+  n = FIX2LONG(size);
+
+#ifndef RSTRUCT_EMBED_LEN_MAX
+  st->ptr = ALLOC_N(VALUE, n);
+  rb_mem_clear(st->ptr, n);
+  st->len = n;
+#else
+  if (0 < n && n <= RSTRUCT_EMBED_LEN_MAX) {
+    RBASIC(st)->flags &= ~RSTRUCT_EMBED_LEN_MASK;
+    RBASIC(st)->flags |= n << RSTRUCT_EMBED_LEN_SHIFT;
+    rb_mem_clear(st->as.ary, n);
+  } else {
+    st->as.heap.ptr = ALLOC_N(VALUE, n);
+    rb_mem_clear(st->as.heap.ptr, n);
+    st->as.heap.len = n;
+  }
+#endif
+
+  return (VALUE)st;
+}
+
+static VALUE hpricot_struct_ref0(VALUE obj) {return H_ELE_GET(obj, 0);}
+static VALUE hpricot_struct_ref1(VALUE obj) {return H_ELE_GET(obj, 1);}
+static VALUE hpricot_struct_ref2(VALUE obj) {return H_ELE_GET(obj, 2);}
+static VALUE hpricot_struct_ref3(VALUE obj) {return H_ELE_GET(obj, 3);}
+static VALUE hpricot_struct_ref4(VALUE obj) {return H_ELE_GET(obj, 4);}
+static VALUE hpricot_struct_ref5(VALUE obj) {return H_ELE_GET(obj, 5);}
+static VALUE hpricot_struct_ref6(VALUE obj) {return H_ELE_GET(obj, 6);}
+static VALUE hpricot_struct_ref7(VALUE obj) {return H_ELE_GET(obj, 7);}
+static VALUE hpricot_struct_ref8(VALUE obj) {return H_ELE_GET(obj, 8);}
+static VALUE hpricot_struct_ref9(VALUE obj) {return H_ELE_GET(obj, 9);}
+
+static VALUE (*ref_func[10])() = {
+  hpricot_struct_ref0,
+  hpricot_struct_ref1,
+  hpricot_struct_ref2,
+  hpricot_struct_ref3,
+  hpricot_struct_ref4,
+  hpricot_struct_ref5,
+  hpricot_struct_ref6,
+  hpricot_struct_ref7,
+  hpricot_struct_ref8,
+  hpricot_struct_ref9,
+};
+
+static VALUE hpricot_struct_set0(VALUE obj, VALUE val) {return H_ELE_SET(obj, 0, val);}
+static VALUE hpricot_struct_set1(VALUE obj, VALUE val) {return H_ELE_SET(obj, 1, val);}
+static VALUE hpricot_struct_set2(VALUE obj, VALUE val) {return H_ELE_SET(obj, 2, val);}
+static VALUE hpricot_struct_set3(VALUE obj, VALUE val) {return H_ELE_SET(obj, 3, val);}
+static VALUE hpricot_struct_set4(VALUE obj, VALUE val) {return H_ELE_SET(obj, 4, val);}
+static VALUE hpricot_struct_set5(VALUE obj, VALUE val) {return H_ELE_SET(obj, 5, val);}
+static VALUE hpricot_struct_set6(VALUE obj, VALUE val) {return H_ELE_SET(obj, 6, val);}
+static VALUE hpricot_struct_set7(VALUE obj, VALUE val) {return H_ELE_SET(obj, 7, val);}
+static VALUE hpricot_struct_set8(VALUE obj, VALUE val) {return H_ELE_SET(obj, 8, val);}
+static VALUE hpricot_struct_set9(VALUE obj, VALUE val) {return H_ELE_SET(obj, 9, val);}
+
+static VALUE (*set_func[10])() = {
+  hpricot_struct_set0,
+  hpricot_struct_set1,
+  hpricot_struct_set2,
+  hpricot_struct_set3,
+  hpricot_struct_set4,
+  hpricot_struct_set5,
+  hpricot_struct_set6,
+  hpricot_struct_set7,
+  hpricot_struct_set8,
+  hpricot_struct_set9,
+};
+
+static VALUE
+make_hpricot_struct(VALUE members)
+{
+  int i = 0;
+  VALUE klass = rb_class_new(rb_cObject);
+  rb_iv_set(klass, "__size__", INT2NUM(RARRAY_LEN(members)));
+  rb_define_alloc_func(klass, alloc_hpricot_struct);
+  rb_define_singleton_method(klass, "new", rb_class_new_instance, -1);
+  for (i = 0; i < RARRAY_LEN(members); i++) {
+    ID id = SYM2ID(RARRAY_PTR(members)[i]);
+    rb_define_method_id(klass, id, ref_func[i], 0);
+    rb_define_method_id(klass, rb_id_attrset(id), set_func[i], 1);
+  }
+  return klass;
+}
+
 void Init_hpricot_scan()
 {
-  mHpricot = rb_define_module("Hpricot");
-  rb_define_attr(rb_singleton_class(mHpricot), "buffer_size", 1, 1);
-  rb_define_singleton_method(mHpricot, "scan", hpricot_scan, -1);
-  rb_define_singleton_method(mHpricot, "css", hpricot_css, 3);
-  rb_eHpricotParseError = rb_define_class_under(mHpricot, "ParseError", rb_eStandardError);
-
-  cDoc = rb_define_class_under(mHpricot, "Doc", rb_cObject);
-  rb_define_alloc_func(cDoc, hpricot_ele_alloc);
-  rb_define_method(cDoc, "children", hpricot_ele_get_children, 0);
-  rb_define_method(cDoc, "children=", hpricot_ele_set_children, 1);
-
-  cBaseEle = rb_define_class_under(mHpricot, "BaseEle", rb_cObject);
-  rb_define_alloc_func(cBaseEle, hpricot_ele_alloc);
-  rb_define_method(cBaseEle, "raw_string", hpricot_ele_get_raw, 0);
-  rb_define_method(cBaseEle, "clear_raw", hpricot_ele_clear_raw, 0);
-  rb_define_method(cBaseEle, "parent", hpricot_ele_get_parent, 0);
-  rb_define_method(cBaseEle, "parent=", hpricot_ele_set_parent, 1);
-  cCData = rb_define_class_under(mHpricot, "CData", cBaseEle);
-  rb_define_method(cCData, "content", hpricot_ele_get_tag, 0);
-  rb_define_method(cCData, "content=", hpricot_ele_set_tag, 1);
-  cComment = rb_define_class_under(mHpricot, "Comment", cBaseEle);
-  rb_define_method(cComment, "content", hpricot_ele_get_tag, 0);
-  rb_define_method(cComment, "content=", hpricot_ele_set_tag, 1);
-  cDocType = rb_define_class_under(mHpricot, "DocType", cBaseEle);
-  rb_define_method(cDocType, "target", hpricot_ele_get_tag, 0);
-  rb_define_method(cDocType, "target=", hpricot_ele_set_tag, 1);
-  rb_define_method(cDocType, "public_id", hpricot_ele_get_public_id, 0);
-  rb_define_method(cDocType, "public_id=", hpricot_ele_set_public_id, 1);
-  rb_define_method(cDocType, "system_id", hpricot_ele_get_system_id, 0);
-  rb_define_method(cDocType, "system_id=", hpricot_ele_set_system_id, 1);
-  cElem = rb_define_class_under(mHpricot, "Elem", cBaseEle);
-  rb_define_method(cElem, "raw_attributes", hpricot_ele_get_attr, 0);
-  rb_define_method(cElem, "raw_attributes=", hpricot_ele_set_attr, 1);
-  rb_define_method(cElem, "children", hpricot_ele_get_children, 0);
-  rb_define_method(cElem, "children=", hpricot_ele_set_children, 1);
-  rb_define_method(cElem, "etag", hpricot_ele_get_etag, 0);
-  rb_define_method(cElem, "etag=", hpricot_ele_set_etag, 1);
-  rb_define_method(cElem, "name", hpricot_ele_get_tag, 0);
-  rb_define_method(cElem, "name=", hpricot_ele_set_tag, 1);
-  cETag = rb_define_class_under(mHpricot, "ETag", cBaseEle);
-  rb_define_method(cETag, "name", hpricot_ele_get_tag, 0);
-  rb_define_method(cETag, "name=", hpricot_ele_set_tag, 1);
-  cBogusETag = rb_define_class_under(mHpricot, "BogusETag", cETag);
-  cText = rb_define_class_under(mHpricot, "Text", cBaseEle);
-  rb_define_method(cText, "content", hpricot_ele_get_tag, 0);
-  rb_define_method(cText, "content=", hpricot_ele_set_tag, 1);
-  cXMLDecl = rb_define_class_under(mHpricot, "XMLDecl", cBaseEle);
-  rb_define_method(cXMLDecl, "encoding", hpricot_ele_get_encoding, 0);
-  rb_define_method(cXMLDecl, "encoding=", hpricot_ele_set_encoding, 1);
-  rb_define_method(cXMLDecl, "standalone", hpricot_ele_get_standalone, 0);
-  rb_define_method(cXMLDecl, "standalone=", hpricot_ele_set_standalone, 1);
-  rb_define_method(cXMLDecl, "version", hpricot_ele_get_version, 0);
-  rb_define_method(cXMLDecl, "version=", hpricot_ele_set_version, 1);
-  cProcIns = rb_define_class_under(mHpricot, "ProcIns", cBaseEle);
-  rb_define_method(cProcIns, "target", hpricot_ele_get_tag, 0);
-  rb_define_method(cProcIns, "target=", hpricot_ele_set_tag, 1);
-  rb_define_method(cProcIns, "content", hpricot_ele_get_attr, 0);
-  rb_define_method(cProcIns, "content=", hpricot_ele_set_attr, 1);
+  VALUE structElem, structAttr, structBasic;
 
   s_ElementContent = rb_intern("ElementContent");
   symAllow = ID2SYM(rb_intern("allow"));
@@ -6677,18 +6854,77 @@ void Init_hpricot_scan()
   s_parent = rb_intern("parent");
   s_read = rb_intern("read");
   s_to_str = rb_intern("to_str");
-  iv_parent = rb_intern("parent");
   sym_xmldecl = ID2SYM(rb_intern("xmldecl"));
   sym_doctype = ID2SYM(rb_intern("doctype"));
   sym_procins = ID2SYM(rb_intern("procins"));
   sym_stag = ID2SYM(rb_intern("stag"));
   sym_etag = ID2SYM(rb_intern("etag"));
   sym_emptytag = ID2SYM(rb_intern("emptytag"));
+  sym_allowed = ID2SYM(rb_intern("allowed"));
+  sym_children = ID2SYM(rb_intern("children"));
   sym_comment = ID2SYM(rb_intern("comment"));
   sym_cdata = ID2SYM(rb_intern("cdata"));
+  sym_name = ID2SYM(rb_intern("name"));
+  sym_parent = ID2SYM(rb_intern("parent"));
+  sym_raw_attributes = ID2SYM(rb_intern("raw_attributes"));
+  sym_raw_string = ID2SYM(rb_intern("raw_string"));
+  sym_tagno = ID2SYM(rb_intern("tagno"));
   sym_text = ID2SYM(rb_intern("text"));
   sym_EMPTY = ID2SYM(rb_intern("EMPTY"));
   sym_CDATA = ID2SYM(rb_intern("CDATA"));
+
+  mHpricot = rb_define_module("Hpricot");
+  rb_define_attr(rb_singleton_class(mHpricot), "buffer_size", 1, 1);
+  rb_define_singleton_method(mHpricot, "scan", hpricot_scan, -1);
+  rb_define_singleton_method(mHpricot, "css", hpricot_css, 3);
+  rb_eHpricotParseError = rb_define_class_under(mHpricot, "ParseError", rb_eStandardError);
+
+  structElem = make_hpricot_struct(rb_ary_new3(8, sym_name, sym_parent,
+    sym_raw_attributes, sym_etag, sym_raw_string, sym_allowed,
+    sym_tagno, sym_children));
+  structAttr = make_hpricot_struct(rb_ary_new3(3, sym_name, sym_parent, sym_raw_attributes));
+  structBasic = make_hpricot_struct(rb_ary_new3(2, sym_name, sym_parent));
+
+  cDoc = rb_define_class_under(mHpricot, "Doc", structElem);
+  cCData = rb_define_class_under(mHpricot, "CData", structBasic);
+  rb_define_method(cCData, "content", hpricot_ele_get_name, 0);
+  rb_define_method(cCData, "content=", hpricot_ele_set_name, 1);
+  cComment = rb_define_class_under(mHpricot, "Comment", structBasic);
+  rb_define_method(cComment, "content", hpricot_ele_get_name, 0);
+  rb_define_method(cComment, "content=", hpricot_ele_set_name, 1);
+  cDocType = rb_define_class_under(mHpricot, "DocType", structAttr);
+  rb_define_method(cDocType, "raw_string", hpricot_ele_get_name, 0);
+  rb_define_method(cDocType, "clear_raw", hpricot_ele_clear_name, 0);
+  rb_define_method(cDocType, "target", hpricot_ele_get_target, 0);
+  rb_define_method(cDocType, "target=", hpricot_ele_set_target, 1);
+  rb_define_method(cDocType, "public_id", hpricot_ele_get_public_id, 0);
+  rb_define_method(cDocType, "public_id=", hpricot_ele_set_public_id, 1);
+  rb_define_method(cDocType, "system_id", hpricot_ele_get_system_id, 0);
+  rb_define_method(cDocType, "system_id=", hpricot_ele_set_system_id, 1);
+  cElem = rb_define_class_under(mHpricot, "Elem", structElem);
+  rb_define_method(cElem, "clear_raw", hpricot_ele_clear_raw, 0);
+  cBogusETag = rb_define_class_under(mHpricot, "BogusETag", structAttr);
+  rb_define_method(cBogusETag, "raw_string", hpricot_ele_get_attr, 0);
+  rb_define_method(cBogusETag, "clear_raw", hpricot_ele_clear_attr, 0);
+  cText = rb_define_class_under(mHpricot, "Text", structBasic);
+  rb_define_method(cText, "raw_string", hpricot_ele_get_name, 0);
+  rb_define_method(cText, "clear_raw", hpricot_ele_clear_name, 0);
+  rb_define_method(cText, "content", hpricot_ele_get_name, 0);
+  rb_define_method(cText, "content=", hpricot_ele_set_name, 1);
+  cXMLDecl = rb_define_class_under(mHpricot, "XMLDecl", structAttr);
+  rb_define_method(cXMLDecl, "raw_string", hpricot_ele_get_name, 0);
+  rb_define_method(cXMLDecl, "clear_raw", hpricot_ele_clear_name, 0);
+  rb_define_method(cXMLDecl, "encoding", hpricot_ele_get_encoding, 0);
+  rb_define_method(cXMLDecl, "encoding=", hpricot_ele_set_encoding, 1);
+  rb_define_method(cXMLDecl, "standalone", hpricot_ele_get_standalone, 0);
+  rb_define_method(cXMLDecl, "standalone=", hpricot_ele_set_standalone, 1);
+  rb_define_method(cXMLDecl, "version", hpricot_ele_get_version, 0);
+  rb_define_method(cXMLDecl, "version=", hpricot_ele_set_version, 1);
+  cProcIns = rb_define_class_under(mHpricot, "ProcIns", structAttr);
+  rb_define_method(cProcIns, "target", hpricot_ele_get_name, 0);
+  rb_define_method(cProcIns, "target=", hpricot_ele_set_name, 1);
+  rb_define_method(cProcIns, "content", hpricot_ele_get_attr, 0);
+  rb_define_method(cProcIns, "content=", hpricot_ele_set_attr, 1);
 
   rb_const_set(mHpricot, rb_intern("ProcInsParse"),
     reProcInsParse = rb_eval_string("/\\A<\\?(\\S+)\\s+(.+)/m"));

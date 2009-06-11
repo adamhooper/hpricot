@@ -8,11 +8,13 @@ module Hpricot
   # :startdoc:
 
   module Node; include Hpricot end
+    class ETag; include Node end
     module Container; include Node end
       class Doc; include Container end
       class Elem; include Container end
 
     module Leaf; include Node end
+      class CData; include Leaf end
       class Text; include Leaf end
       class XMLDecl; include Leaf end
       class DocType; include Leaf end

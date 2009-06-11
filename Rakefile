@@ -10,7 +10,7 @@ RbConfig = Config unless defined?(RbConfig)
 
 NAME = "hpricot"
 REV = (`#{ENV['GIT'] || "git"} rev-list HEAD`.split.length + 1).to_s
-VERS = ENV['VERSION'] || "0.6" + (REV ? ".#{REV}" : "")
+VERS = ENV['VERSION'] || "0.8" + (REV ? ".#{REV}" : "")
 PKG = "#{NAME}-#{VERS}"
 BIN = "*.{bundle,jar,so,o,obj,pdb,lib,def,exp,class}"
 CLEAN.include ["ext/hpricot_scan/#{BIN}", "ext/fast_xs/#{BIN}", "lib/**/#{BIN}",
@@ -53,7 +53,7 @@ SPEC =
   end
 
 Win32Spec = SPEC.dup
-Win32Spec.platform = 'mswin32'
+Win32Spec.platform = 'x86-mswin32'
 Win32Spec.files = PKG_FILES + ["lib/hpricot_scan.so", "lib/fast_xs.so"]
 Win32Spec.extensions = []
   
@@ -181,7 +181,7 @@ task :package_win32 => ["fast_xs_win32", "hpricot_scan_win32"] do
   Dir.chdir("#{WIN32_PKG_DIR}") do
     Gem::Builder.new(Win32Spec).build
     verbose(true) {
-      mv Dir["*.gem"].first, "../pkg/#{WIN32_PKG_DIR}.gem"
+      mv Dir["*.gem"].first, "../pkg/"
     }
   end
 end

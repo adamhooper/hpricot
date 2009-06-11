@@ -17,10 +17,11 @@ module Hpricot
     end
   end
 
-  class BaseEle
+  module Node
     def html_quote(str)
       "\"" + str.gsub('"', '\\"') + "\""
     end
+    def clear_raw; end
     def if_output(opts)
       if opts[:preserve] and not raw_string.nil?
         raw_string
@@ -37,6 +38,35 @@ module Hpricot
     end
   end
 
+  class Attributes
+    attr_accessor :element
+    def initialize e
+      @element = e
+    end
+    def [] k 
+      Hpricot.uxs((@element.raw_attributes || {})[k])
+    end
+    def []= k, v
+      (@element.raw_attributes ||= {})[k] = v.fast_xs
+    end
+    def to_hash
+      if @element.raw_attributes
+        @element.raw_attributes.inject({}) do |hsh, (k, v)|
+          hsh[k] = Hpricot.uxs(v)
+          hsh
+        end
+      else
+        {}
+      end
+    end
+    def to_s
+      to_hash.to_s
+    end
+    def inspect
+      to_hash.inspect
+    end
+  end
+
   class Elem
     def initialize tag, attrs = nil, children = nil, etag = nil
       self.name, self.raw_attributes, self.children, self.etag =
@@ -44,14 +74,7 @@ module Hpricot
     end
     def empty?; children.nil? or children.empty? end
     def attributes
-      if raw_attributes
-        raw_attributes.inject({}) do |hsh, (k, v)|
-          hsh[k] = Hpricot.uxs(v)
-          hsh
-        end
-      else
-        {}
-      end
+      Attributes.new self
     end
     def to_plain_text
       if self.name == 'br'
@@ -77,13 +100,10 @@ module Hpricot
       if children
         children.each { |n| n.output(out, opts) }
       end
-      if etag
-        etag.output(out, opts)
-      elsif !opts[:preserve] && !empty?
-        out <<
-          if_output(opts) do
-            "</#{name}>"
-          end
+      if opts[:preserve]
+        out << etag if etag
+      elsif etag or !empty?
+        out << "</#{name}>"
       end
       out
     end
@@ -101,17 +121,14 @@ module Hpricot
     end
   end
 
-  class ETag
+  class BogusETag
     def initialize name; self.name = name end
     def output(out, opts = {})
-      out <<
-        if_output(opts) do
-          "</#{name}>"
-        end
+      out << if_output(opts) { "" }
     end
   end
 
-  class BogusETag
+  class ETag < BogusETag
     def output(out, opts = {}); out << if_output(opts) { '' }; end
   end
 
@@ -137,6 +154,8 @@ module Hpricot
     def initialize content; self.content = content end
     alias_method :to_s, :content
     alias_method :to_plain_text, :content
+    alias_method :inner_text, :content
+    def raw_string; "<![CDATA[#{content}]]>" end
     def output(out, opts = {})
       out <<
         if_output(opts) do
@@ -175,6 +194,7 @@ module Hpricot
 
   class ProcIns
     def pathname; "procins()" end
+    def raw_string; output("") end
     def output(out, opts = {})
       out << 
         if_output(opts) do
@@ -187,6 +207,7 @@ module Hpricot
 
   class Comment
     def pathname; "comment()" end
+    def raw_string; "<!--#{content}-->" end
     def output(out, opts = {})
       out <<
         if_output(opts) do

@@ -227,6 +227,14 @@ class TestParser < Test::Unit::TestCase
     assert_kind_of Hpricot::Elements, @boingboing.search('//div/p').search('a img')
   end
 
+  def test_attr_casing
+    doc = Hpricot("<a HREF='a'>A simple <b>test</b> string.</a>")
+    assert_equal (doc % :a)[:href], "a"
+    assert_equal (doc % :a)[:HREF], nil
+    assert_equal (doc % :a)['href'], "a"
+    assert_equal (doc % :a)['HREF'], nil
+  end
+
   def test_class_search
     # test case sent by Chih-Chao Lam
     doc = Hpricot("<div class=xyz'>abc</div>")
@@ -405,5 +413,16 @@ class TestParser < Test::Unit::TestCase
     else
       assert_equal "\303\251", Hpricot.uxs('&eacute;')
     end
+  end
+
+  def test_cdata_inner_text
+    xml = Hpricot.XML(%{
+      <peon>
+        <id>96586</id>
+        <stdout><![CDATA[This is STDOUT]]></stdout>
+        <stderr><!-- IGNORE --><![CDATA[This is]]> STDERR</stderr>
+      </peon>})
+      assert_equal "This is STDOUT", (xml/:peon/:stdout).inner_text
+      assert_equal "This is STDERR", (xml/:peon/:stderr).inner_text
   end
 end
